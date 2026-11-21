@@ -133,6 +133,9 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A prompt pass reads this long between rounds while other streams decode (0: a whole pass at once).
     fill_slice_ns: u64 = 0,
+    /// After a long whole prompt pass, the streams within this many tokens of their max_tokens decode before the next
+    /// request's pass (0: none is waited for: every queued pass reads first, then their streams decode together).
+    finish_left: u32 = 256,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
     /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears
@@ -167,7 +170,13 @@ pub const Open = struct {
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+pub const Opened = struct {
+    engine: Engine,
+    close: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+    /// After ``close`` the process must not run libc exit(): the server leaves through _exit (server/leave.zig).
+    raw_exit: bool = false,
+};
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
 
@@ -200,6 +209,26 @@ pub const Status = struct {
 
 pub const SubmitError = error{ Closed, Busy };
 
+/// A prompt-cache transfer (POST /cache/probe, export, import): the request thread fills it and waits for the engine's.
+pub const CacheOp = struct {
+    kind: Kind,
+    prompt: []const u32 = &.{}, // probe, export: the rendered prompt; import: the ids the state carries
+    chunks: []const u32 = &.{}, // probe, export: the prompt's chunk starts (a planned family's)
+    at: u32 = 0, // import: the positions the state covers
+    slot: []const u8 = &.{}, // import: the state's own bytes
+    rows: []const u8 = &.{}, // import: its blocks' rows
+    gpa: Allocator, // export: `out` is allocated here (the caller frees its ids and parts)
+    out: ?prompt_cache.Exported = null, // export: the state off the engine
+    tokens: u32 = 0, // probe: the positions a kept state covers (0: none); export, import: the state's
+    err: ?anyerror = null, // NoState: nothing kept covers the prompt; NoCache: this engine keeps no states
+    done: bool = false,
+
+    pub const Kind = enum { probe, export_state, import_state };
+};
+
+/// What an engine's kept states look like on the wire (prompt_cache's Store.shape).
+pub const CacheShape = cache_wire.Shape;
+
 pub const Engine = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -216,6 +245,10 @@ pub const Engine = struct {
         keepalive: ?*const fn (ctx: *anyopaque) ?keepalive.Target = null,
         /// One logit per label, and the vocabulary logsumexp. Null until a family scores decisions.
         score: ?*const fn (ctx: *anyopaque, prompt: []const u32, labels: []const u32, logits: []f64) error{Failed}!f64 = null,
+        /// A prompt-cache transfer, run on the engine's thread; returns when `op.done`. Null: no transfers.
+        cache: ?*const fn (ctx: *anyopaque, op: *CacheOp) void = null,
+        /// What this engine's kept states look like on the wire; null: it moves none (read from HTTP threads).
+        cache_shape: ?*const fn (ctx: *anyopaque) ?CacheShape = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -244,6 +277,18 @@ pub const Engine = struct {
         const f = e.vtable.score orelse return error.Unsupported;
         return f(e.ctx, prompt, labels, logits);
     }
+
+    /// A prompt-cache transfer (`op` filled in on return), or Unsupported when this engine moves no states.
+    pub fn cacheOp(e: Engine, op: *CacheOp) error{Unsupported}!void {
+        const f = e.vtable.cache orelse return error.Unsupported;
+        f(e.ctx, op);
+    }
+
+    /// What this engine's kept states look like on the wire, or null when it moves none.
+    pub fn cacheShape(e: Engine) ?CacheShape {
+        const f = e.vtable.cache_shape orelse return null;
+        return f(e.ctx);
+    }
 };
 
 /// A backend's own driver for a lone greedy stream (the GPU round), which LaneHost runs while the stream is alone.
@@ -267,6 +312,9 @@ pub const LaneHost = @import("lane_host.zig").LaneHost;
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
 
+/// A kept prompt state on the wire (cache_wire.zig): the signed header and sf-disk's payload layout.
+pub const cache_wire = @import("cache_wire.zig");
+
 /// Learned prompt-cache states on disk (prompt_imprint.zig).
 pub const prompt_imprint = @import("prompt_imprint.zig");
 
@@ -274,7 +322,9 @@ pub const prompt_imprint = @import("prompt_imprint.zig");
 pub const keepalive = @import("keepalive.zig");
 
 test {
+    _ = @import("cache_wire.zig");
     _ = @import("lane_host.zig");
+    _ = @import("lane_host_cache.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("lane_host_encode_test.zig");
     _ = @import("prompt_cache.zig");

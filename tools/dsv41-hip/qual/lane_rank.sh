@@ -19,4 +19,10 @@ pin=()
 [ -n "${ENGINE_CPUS:-}" ] && pin=(taskset -c "$ENGINE_CPUS")
 cd "$DIR"
 echo $$ > "rank$R.pid"
-exec "${pin[@]}" env -i "${SERVE_ENV[@]}" "${SERVE_CMD[@]}" > "rank$R.jsonl" 2> "rank$R.err"
+# the rank's WRAP applied as serve_lib.sh serve_spawn applies it (wv=WRAP$RANK): without it a box whose ROCm is only on
+# WRAP's LD_LIBRARY_PATH dies with DriverUnavailable before any load (2026-11-11)
+wv=WRAP$RANK
+wrap=()
+[ -n "${!wv:-}" ] && read -ra wrap <<< "${!wv}"
+echo "wrap ($wv, as serve_spawn): ${wrap[*]:-(none)}" >> "rank$R.cmd"
+exec "${pin[@]}" env -i "${SERVE_ENV[@]}" "${wrap[@]}" "${SERVE_CMD[@]}" > "rank$R.jsonl" 2> "rank$R.err"

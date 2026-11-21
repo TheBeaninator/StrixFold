@@ -214,6 +214,69 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
     try std.testing.expect(seq.a_done.? < seq.b_first.?);
 }
 
+test "finish_left 0: after a long prompt pass the next request's pass reads before the first stream ends" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    const Slow = struct {
+        // each prompt pass takes 1.1 s, a long pass for the host (its whole pass runs inside the admission)
+        fn hook(_: *anyopaque, _: *lanes.stream.Stream, _: usize) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1100), .awake) catch {};
+        }
+    };
+    var unused: u8 = 0;
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_hook = Slow.hook, .prefill_hook_ctx = &unused };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .finish_left = 0 });
+    try host.start();
+    defer host.stop();
+    const Seq = struct {
+        mutex: std.Io.Mutex = .init,
+        n: u32 = 0,
+        a_done: ?u32 = null,
+        b_first: ?u32 = null,
+        b_done: bool = false,
+        fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
+            const q: *@This() = @ptrCast(@alignCast(ctx));
+            q.mutex.lockUncancelable(std.testing.io);
+            defer q.mutex.unlock(std.testing.io);
+            q.n += 1;
+            switch (e.*) {
+                .tokens => if (id == 2 and q.b_first == null) {
+                    q.b_first = q.n;
+                },
+                .finished => if (id == 1) {
+                    q.a_done = q.n;
+                } else {
+                    q.b_done = true;
+                },
+                else => {},
+            }
+        }
+        fn done(q: *@This()) bool {
+            q.mutex.lockUncancelable(std.testing.io);
+            defer q.mutex.unlock(std.testing.io);
+            return q.a_done != null and q.b_done;
+        }
+    };
+    var seq: Seq = .{};
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    const e = host.engine();
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 64 }, .{ .ctx = &seq, .event = Seq.event });
+    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 64 }, .{ .ctx = &seq, .event = Seq.event });
+    for (0..10000) |_| {
+        if (seq.done()) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(seq.done());
+    // no stream is waited for: the second request's pass ran right after the first's (no round between them), so its
+    // first token came before the first request (64 tokens to decode) ended, and the two then shared the rounds
+    try std.testing.expect(seq.b_first.? < seq.a_done.?);
+}
+
 /// Each request's tokens and end, and each prompt pass's round count at every one of its chunks (in order of passes).
 const Slices = struct {
     mutex: std.Io.Mutex = .init,

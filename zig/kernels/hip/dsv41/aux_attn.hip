@@ -3,28 +3,35 @@
  * and on the prompt path (one pass, the output directly). ADAPTER.md section 6: group "aux", one by-value struct
  * (tf_ds_aux_attn_args, abi.h), registered in registry.json.
  *
- * What it computes, for each row r and head h (heads 32, head dim 512 a rank):
+ * What it computes, for each row r and head h (heads H = 32 or 16, head dim 512 a rank; TP2 ranks hold 32 heads, TP4
+ * ranks 16):
  *   keys: the window positions p-127 .. p that exist (a ring: slot = position % ring_size, plus the row's ring base;
  *   or linear rows from position wlo), then the row's picks idx[r, j] >= 0 (plus the row's compressed base), as bf16
  *   rows or packed FP4 (E2M1 codes: byte j = element j | element j + 256 << 4; E4M3 scale per 16 elements);
  *   s = (q . k) * scale (fp32), online softmax over the split's keys in chunks of 16 (m from -1e30, p = exp(s - m)),
  *   l += p (fp32), acc += bf16(p) . k (fp32: p rounded to bf16 before the PV product, as DeepSeek's and TensorFold's
- *   kernels do). Split mode writes m, l, acc in _sparse_attn_part's partial layout (base = (r * 2 + h / 16) * splits
- *   + split; m at base * 16 + h % 16); the one-pass mode writes bf16(acc / (l + exp(sink[h] - m))).
+ *   kernels do). Split mode writes m, l, acc in _sparse_attn_part's partial layout (base = (r * H / 16 + h / 16) *
+ *   splits + split; m at base * 16 + h % 16); the one-pass mode writes bf16(acc / (l + exp(sink[h] - m))).
  * Key chunks: the window's 128 keys are chunks 0..7, the picks chunks 8..; split s takes chunks s, s + splits, ...
  * A row's results never depend on the other rows of the launch (row invariance), only on its own keys and splits.
- * Work: a workgroup a (row, split), all 32 heads (each key is read once a workgroup), 8 waves. Per chunk: S = Q K^T
- * by WMMA (wave w: heads 16 (w % 2), dims 128 (w / 2) of the 512 in two chains, its partial added in a fixed order)
- * and the keys transposed for PV | the softmax step (8 threads a head, DPP shuffles), then the next chunk's keys
- * staged in LDS as bf16 (FP4 decoded exactly through an fp16 byte table, the loads issued a chunk ahead, the picks two
- * chunks ahead) | acc += P K by WMMA (wave w: heads 16 (w / 4), dims 128 (w % 4): 8 accumulator tiles in registers):
- * three barriers a chunk. 42.7 KB of LDS and at most 6 waves a SIMD (the compiler holds VGPRs to that; 12 bytes of
+ * Work: a workgroup a (row, split), all H heads (each key is read once a workgroup), 8 waves. Per chunk: S = Q K^T
+ * by WMMA (dims in 4 quarters of 128, each in two chains of 4 k-steps, even and odd; H = 32: wave w takes heads 16
+ * (w % 2), quarter w / 2, both chains; H = 16: wave w takes quarter w / 2, chain w % 2) and the keys transposed for PV
+ * | the softmax step (8 threads a head, DPP shuffles; H = 16: waves 0-3), then the next chunk's keys staged in LDS as
+ * bf16 (FP4 decoded exactly through an fp16 byte table, the loads issued a chunk ahead, the picks two chunks ahead) |
+ * acc += P K by WMMA (H = 32: wave w: heads 16 (w / 4), dims 128 (w % 4), 8 accumulator tiles; H = 16: dims 64 w,
+ * 4 tiles): three barriers a chunk.
+ * Both builds do the same arithmetic for a head, in the same order: S = ((q0 + q1) + q2) + q3 with quarter qk = chain
+ * 0 + chain 1 (each chain WMMA k-steps in the same order), the same softmax lanes and shuffles, the same PV tile per
+ * (head, 16 dims). So the 16-head build's heads 0-15 (16-31) equal the 32-head build's heads 0-15 (16-31) bit for bit
+ * on the same keys, picks and sink slice (t_hipattn.py checks it on device): a TP4 rank gives the TP2 rank's bits. 42.7 KB of LDS and at most 6 waves a SIMD (the compiler holds VGPRs to that; 12 bytes of
  * scratch a lane, a few accesses a chunk): three workgroups a WGP.
  * Measured (2048 prompt rows, 512 FP4 picks, one pass): 4.9 ms vs 6.1 (two workgroups a WGP) and 8.2 (the scalar
  * FP4 decode, four barriers); the Triton kernel about 35 ms.
  * WMMA layouts (gfx11 wave32, v_wmma_f32_16x16x16_bf16; probed by t_hipattn.py): A: lane l holds row l % 16's 16 k;
  * B: lane l holds column l % 16's 16 k; D: lane l holds column l % 16, rows 2 i + l / 16 (element i). Lanes 16-31
  * repeat 0-15's A and B. */
+#ifndef TF_ATTN_H
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include "abi.h"
@@ -33,7 +40,7 @@ typedef __bf16 tf_bf16x16 __attribute__((ext_vector_type(16)));
 typedef float tf_f32x8 __attribute__((ext_vector_type(8)));
 
 namespace {
-constexpr int H = 32, HD = 512, CH = 16, WIN = 128, NWAVE = 8;
+constexpr int HD = 512, CH = 16, WIN = 128, NWAVE = 8;
 
 __device__ inline float bf16_to_f32(uint16_t b) { return __uint_as_float(uint32_t(b) << 16); }
 
@@ -144,9 +151,30 @@ __device__ inline void fp4x4_bf16(uint32_t c, tf_h2 sc2, uint32_t& lo, uint32_t&
 // bits), by truncation
 __device__ inline uint32_t bf16_exact(float v) { return __float_as_uint(v) >> 16; }
 
-// at most 6 waves a SIMD (VGPRs held to fit): three workgroups a WGP
+// The kernel, once a head count: this file includes itself with TF_ATTN_H / TF_ATTN_NAME set (one source, so the
+// build's input is this file alone). A kernel of its own a head count, not a template body called from two kernels:
+// the 32-head build's machine code stays the one TP2 has run (a wrapper changed its kernel-argument loads and schedule).
+#define TF_ATTN_H 32
+#define TF_ATTN_NAME tf_ds_aux_sparse_attn_h32_d512
+#include "aux_attn.hip"
+#undef TF_ATTN_H
+#undef TF_ATTN_NAME
+#define TF_ATTN_H 16
+#define TF_ATTN_NAME tf_ds_aux_sparse_attn_h16_d512
+#include "aux_attn.hip"
+#undef TF_ATTN_H
+#undef TF_ATTN_NAME
+
+#else  // TF_ATTN_H: the kernel for TF_ATTN_H heads
+
+// at most 6 waves a SIMD (VGPRs held to fit): three workgroups a WGP (LDS: 42.7 KB a workgroup at either H)
 extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6)))
-void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
+void TF_ATTN_NAME(tf_ds_aux_attn_args a) {
+    constexpr int H = TF_ATTN_H;
+    static_assert(H == 32 || H == 16, "heads 32 or 16");
+    constexpr int HT = H / 16;           // head tiles of 16
+    constexpr int WPT = NWAVE / HT;      // PV: waves a head tile
+    constexpr int NT = (HD / 16) / WPT;  // PV: 16-dim accumulator tiles a wave (8 or 4)
     // the chunk's keys by key (S's B operand): rows padded by 16 bytes so the 16 lanes reading 16 rows at one column
     // hit different LDS banks
     __shared__ __attribute__((aligned(32))) __bf16 kc[CH][HD + 8];
@@ -154,7 +182,8 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
     // 16-byte halves swap places when bit 2 of the row is set (swz16), so 8 lanes reading 8 rows hit different banks
     __shared__ __attribute__((aligned(32))) __bf16 kt[HD][CH];
     __shared__ __attribute__((aligned(32))) __bf16 pc[H][CH];
-    __shared__ __attribute__((aligned(16))) float sp[4][2][16][16]; // S partials: dims quarter x head tile x head x key
+    // S partials: dims quarter x (H = 32: head tile, both chains added; H = 16: chain) x head x key
+    __shared__ __attribute__((aligned(16))) float sp[4][2][16][16];
     __shared__ float m_s[H], l_s[H], al_s[H];
     __shared__ int32_t kval[2][CH];                                // the chunk's key validity (double-buffered)
     // (42.7 KB in all: three workgroups a WGP)
@@ -174,15 +203,18 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
         m_s[tid] = -1e30f;
         l_s[tid] = 0.f;
     }
-    // this wave's S work: heads 16 s_mt, dims 128 s_kq; its 8 Q fragments stay in registers for every chunk
-    const int s_mt = w & 1, s_kq = w >> 1;
-    tf_bf16x16 qf[8];
+    // this wave's S work: heads 16 s_mt, dims 128 s_kq, k-steps s_ch0, s_ch0 + KST, ... (H = 32: all 8, both chains;
+    // H = 16: chain s_ch0's 4); its Q fragments stay in registers for every chunk
+    constexpr int NQF = 8 / (3 - HT), KST = 3 - HT;    // fragments a wave, k-step stride (32: 8, 1; 16: 4, 2)
+    const int s_mt = HT == 2 ? (w & 1) : 0, s_kq = w >> 1, s_ch0 = HT == 2 ? 0 : (w & 1);
+    tf_bf16x16 qf[NQF];
 #pragma unroll
-    for (int ks = 0; ks < 8; ++ks) qf[ks] = frag_row_g(q + (s_mt * 16 + l16) * HD + s_kq * 128 + ks * 16);
-    const int pv_mt = w >> 2, pv_n0 = (w & 3) * 8;    // PV tiles of this wave: heads 16 pv_mt, dim tiles pv_n0 ..
-    tf_f32x8 acc[8];
+    for (int k = 0; k < NQF; ++k)
+        qf[k] = frag_row_g(q + (s_mt * 16 + l16) * HD + s_kq * 128 + (s_ch0 + k * KST) * 16);
+    const int pv_mt = w / WPT, pv_n0 = (w % WPT) * NT; // PV tiles of this wave: heads 16 pv_mt, dim tiles pv_n0 ..
+    tf_f32x8 acc[NT];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) acc[j] = tf_f32x8{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int j = 0; j < NT; ++j) acc[j] = tf_f32x8{0, 0, 0, 0, 0, 0, 0, 0};
     __syncthreads();
 
     const int sn = tid >> 4, sj = tid & 15;          // the staged key and the piece column of this thread
@@ -292,23 +324,40 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
                 kr[sw ^ 1] = tf_u32x4{col[4], col[5], col[6], col[7]};
             }
             tf_f32x8 s0 = {0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
+            if constexpr (HT == 2) {
 #pragma unroll
-            for (int ks = 0; ks < 8; ks += 2) {
-                s0 = wmma(qf[ks], frag_row(&kc[l16][s_kq * 128 + ks * 16]), s0);
-                s1 = wmma(qf[ks + 1], frag_row(&kc[l16][s_kq * 128 + ks * 16 + 16]), s1);
+                for (int ks = 0; ks < 8; ks += 2) {
+                    s0 = wmma(qf[ks], frag_row(&kc[l16][s_kq * 128 + ks * 16]), s0);
+                    s1 = wmma(qf[ks + 1], frag_row(&kc[l16][s_kq * 128 + ks * 16 + 16]), s1);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sp[s_kq][s_mt][2 * i + hi][l16] = s0[i] + s1[i];
+            } else {
+                // one chain (k-steps s_ch0, s_ch0 + 2, ..: the 32-head build's s0 or s1), added to the other in step 2
+#pragma unroll
+                for (int k = 0; k < 4; ++k) s0 = wmma(qf[k], frag_row(&kc[l16][s_kq * 128 + (s_ch0 + 2 * k) * 16]), s0);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sp[s_kq][s_ch0][2 * i + hi][l16] = s0[i];
             }
-#pragma unroll
-            for (int i = 0; i < 8; ++i) sp[s_kq][s_mt][2 * i + hi][l16] = s0[i] + s1[i];
         }
         lds_sync();
         // 2. the softmax step: 8 threads a head, 2 keys a thread; max and sum over the 8 by DPP xor shuffles; then
         // the next chunk's keys staged into kc and the one after it loaded
-        {
-            const int h = tid >> 3, g = tid & 7, mt = h >> 4, hr = h & 15;
+        if (HT == 2 || tid < 8 * H) {   // H = 16: waves 0-3 (a wave-uniform test)
+            const int h = tid >> 3, g = tid & 7, mt = HT == 2 ? h >> 4 : 0, hr = h & 15;
             typedef float f2 __attribute__((ext_vector_type(2)));
             f2 sp2[4];
 #pragma unroll
-            for (int k = 0; k < 4; ++k) sp2[k] = *reinterpret_cast<const f2*>(&sp[k][mt][hr][2 * g]);
+            for (int k = 0; k < 4; ++k) {
+                if constexpr (HT == 2) {
+                    sp2[k] = *reinterpret_cast<const f2*>(&sp[k][mt][hr][2 * g]);
+                } else {
+                    // chain 0 + chain 1: the 32-head build's s0[i] + s1[i]
+                    const f2 c0 = *reinterpret_cast<const f2*>(&sp[k][0][hr][2 * g]);
+                    const f2 c1 = *reinterpret_cast<const f2*>(&sp[k][1][hr][2 * g]);
+                    sp2[k] = f2{c0[0] + c1[0], c0[1] + c1[1]};
+                }
+            }
             float sv[2];
             const float m_old = m_s[h];
             float mx = m_old;
@@ -341,14 +390,14 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
             pk = idx_of(c + 3 * splits);
         }
         lds_sync();
-        // 3. acc = acc * alpha + P K: wave w: heads 16 pv_mt, dim tiles pv_n0 .. + 8
+        // 3. acc = acc * alpha + P K: wave w: heads 16 pv_mt, dim tiles pv_n0 .. + NT
         {
             const tf_bf16x16 fa = frag_swz(&pc[pv_mt * 16 + l16][0], (l16 >> 2) & 1);
             float al[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) al[i] = al_s[pv_mt * 16 + 2 * i + hi];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < NT; ++j) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) acc[j][i] *= al[i];
                 acc[j] = wmma(fa, frag_swz(&kt[(pv_n0 + j) * 16 + l16][0], (l16 >> 2) & 1), acc[j]);
@@ -366,7 +415,7 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
             const int h = pv_mt * 16 + 2 * i + hi;
             const float den = l_s[h] + expf(sink[h] - m_s[h]);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) out[h * HD + (pv_n0 + j) * 16 + l16] = (__bf16)(acc[j][i] / den);
+            for (int j = 0; j < NT; ++j) out[h * HD + (pv_n0 + j) * 16 + l16] = (__bf16)(acc[j][i] / den);
         }
         return;
     }
@@ -383,6 +432,8 @@ void tf_ds_aux_sparse_attn_h32_d512(tf_ds_aux_attn_args a) {
         const int h = pv_mt * 16 + 2 * i + hi;
         const int64_t base = ((int64_t)r * (H / 16) + h / 16) * splits + split;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) po[(base * 16 + h % 16) * HD + (pv_n0 + j) * 16 + l16] = acc[j][i];
+        for (int j = 0; j < NT; ++j) po[(base * 16 + h % 16) * HD + (pv_n0 + j) * 16 + l16] = acc[j][i];
     }
 }
+
+#endif  // TF_ATTN_H

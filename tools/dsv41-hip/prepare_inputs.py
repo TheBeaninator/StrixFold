@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare DeepSeek CPU assets; optionally build and verify both native rank caches.
+"""Prepare DeepSeek CPU assets; optionally build and verify every native rank cache (TP2: two, TP4 2D split: four).
 
 The default full-input mode requires the complete locked checkpoint, two real CPU
 executables and enough disk space. --assets-only is explicitly a smaller scope.
@@ -279,10 +279,37 @@ def run_cpu_tool(executable: Path, args: list[str], log: Path) -> dict:
             "log": log.name, "log_sha256": sha256_file(log), "report": report}
 
 
+def build_rank_caches(model: Path, output: Path, required: dict, rank_cache_bin: Path, check_bin: Path) -> list:
+    """Each rank of required["ranks"] (one world): build its file, check every entry's bytes (--bytes 1) against the
+    checkpoint, and hold the check report and the file size to the Python schema (inventory_checkpoint.rank_plan)."""
+    reports = []
+    worlds = {r["world"] for r in required["ranks"]}
+    if len(worlds) != 1 or sorted(r["rank"] for r in required["ranks"]) != list(range(next(iter(worlds)))):
+        raise InputError("rank plans must cover ranks 0..world-1 of one world")
+    world = next(iter(worlds))
+    for plan in required["ranks"]:
+        rank = plan["rank"]
+        rank_dir = output / f"rank{rank}" / "rank-cache"
+        rank_dir.mkdir(parents=True)
+        build = run_cpu_tool(rank_cache_bin, [str(model), str(rank_dir), str(rank), str(world)], output / f"rank{rank}-build.log")
+        check = run_cpu_tool(check_bin, [str(model), str(rank_dir), str(rank), str(world), "--bytes", "1"], output / f"rank{rank}-check.log")
+        report = check["report"]
+        if (report.get("ok") is not True or any(report.get(k) != plan["entry_count"] for k in ("entries", "planned", "compared"))
+                or report.get("compared_bytes") != plan["data_bytes"] or plan["data_bytes"] <= 0
+                or any(report.get(k) != 0 for k in ("mismatches", "layout_mismatches", "byte_mismatches"))):
+            raise InputError(f"rank {rank} of {world} full byte validation did not cover its exact schema")
+        files = list(rank_dir.glob(f"rank{rank}of{world}-*.bin"))
+        if len(files) != 1 or files[0].stat().st_size != plan["rank_file_bytes"]:
+            raise InputError(f"rank {rank} of {world} produced an unexpected file count/size")
+        reports.append({"rank": rank, "world": world, "file": str(files[0].relative_to(output)),
+                        "bytes": files[0].stat().st_size, "build": build, "byte_check": check})
+    return reports
+
+
 def prepare(model: Path, output: Path, rows: int, lock: dict, assets_only=False,
             rank_cache_bin: Path | None = None, check_bin: Path | None = None,
             rope_reference: Path | None = None, engram_dir: Path | None = None,
-            allow_unlocked_fixture=False) -> dict:
+            allow_unlocked_fixture=False, world: int = 2) -> dict:
     model, output = model.resolve(), output.resolve()
     if output == model or output.is_relative_to(model):
         raise InputError("output must be outside the original model snapshot")
@@ -302,7 +329,9 @@ def prepare(model: Path, output: Path, rows: int, lock: dict, assets_only=False,
         raise InputError("unlocked fixtures are only allowed in the explicit assets-only mode")
     authenticated_assets = [] if allow_unlocked_fixture else verify_files(
         model, load_snapshot(lock, "checkpoint"), ["config.json", "tokenizer.json"])
-    required = inventory(model, lock, include_plans=True, verify_content=True) if not assets_only else None
+    if world not in (2, 4):
+        raise InputError("rank caches are built for TP2 or the TP4 2D split")
+    required = inventory(model, lock, include_plans=True, world=world, verify_content=True) if not assets_only else None
     engram_files = []
     if not assets_only:
         if rank_cache_bin is None or check_bin is None:
@@ -354,21 +383,7 @@ def prepare(model: Path, output: Path, rows: int, lock: dict, assets_only=False,
         rank_reports = []
         if required:
             atomic_json(output / "inventory.json", required)
-            for rank in (0, 1):
-                rank_dir = output / f"rank{rank}" / "rank-cache"
-                rank_dir.mkdir(parents=True)
-                build = run_cpu_tool(rank_cache_bin, [str(model), str(rank_dir), str(rank), "2"], output / f"rank{rank}-build.log")
-                check = run_cpu_tool(check_bin, [str(model), str(rank_dir), str(rank), "2", "--bytes", "1"], output / f"rank{rank}-check.log")
-                report, plan = check["report"], required["ranks"][rank]
-                if (report.get("ok") is not True or any(report.get(k) != plan["entry_count"] for k in ("entries", "planned", "compared"))
-                        or report.get("compared_bytes") != plan["data_bytes"] or plan["data_bytes"] <= 0
-                        or any(report.get(k) != 0 for k in ("mismatches", "layout_mismatches", "byte_mismatches"))):
-                    raise InputError(f"rank {rank} full byte validation did not cover its exact schema")
-                files = list(rank_dir.glob(f"rank{rank}of2-*.bin"))
-                if len(files) != 1 or files[0].stat().st_size != required["ranks"][rank]["rank_file_bytes"]:
-                    raise InputError(f"rank {rank} produced an unexpected file count/size")
-                rank_reports.append({"rank": rank, "file": str(files[0].relative_to(output)),
-                                     "bytes": files[0].stat().st_size, "build": build, "byte_check": check})
+            rank_reports = build_rank_caches(model, output, required, rank_cache_bin, check_bin)
         if sha256_file(model / "config.json") != config_hash:
             raise InputError("original config changed during preparation")
         files = []
@@ -385,7 +400,7 @@ def prepare(model: Path, output: Path, rows: int, lock: dict, assets_only=False,
                   "engram_files": engram_files, "engram_directory": str(engram_dir.resolve()) if engram_dir else None,
                   "text_only": True, "vision_initialized": False, "rows": rows,
                   "compressed_vocab": compressed, "rope_reference_hashes_verified": rope["reference_hashes_verified"],
-                  "rank_caches": rank_reports, "files": files,
+                  "world": world, "rank_caches": rank_reports, "files": files,
                   "dependencies": {n: version(n) for n in ("numpy", "tokenizers", "torch")},
                   "python": sys.version, "hip_kernel_kit": "not_provided_by_cpu_preparation",
                   "full_model_numerical_qualification": "unrun", "hardware_qualification": "unrun"}
@@ -410,11 +425,12 @@ def main() -> int:
     ap.add_argument("--check-bin", type=Path)
     ap.add_argument("--engram-dir", type=Path)
     ap.add_argument("--rope-reference", type=Path, help="optional canonical rope.json with matching rows and hashes")
+    ap.add_argument("--world", type=int, choices=(2, 4), default=2, help="2: the TP2 pair's two rank files; 4: the 2D split's four")
     args = ap.parse_args()
     try:
         result = prepare(args.model, args.output, args.rows, read_json(args.lock), args.assets_only,
                          args.rank_cache_bin, args.check_bin, args.rope_reference, args.engram_dir,
-                         args.allow_unlocked_fixture)
+                         args.allow_unlocked_fixture, args.world)
         print(json.dumps({k: result[k] for k in ("status", "scope", "config_sha256", "rows", "hardware_qualification")}, sort_keys=True))
         return 0
     except (InputError, OSError, KeyError, TypeError, ValueError) as exc:

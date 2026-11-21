@@ -23,6 +23,25 @@
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+//!   TF_HC_CHAIN=1                               hc_pre2's whole decode chain, the post alone included, as one launch
+//!                                                 a site (tri_hc: the same bits; needs the kit's _hc_chain;
+//!                                                 windows of up to 6 rows, chain_rows)
+//!   TF_FUSE2=1                                  a decode token's router as one launch a layer, _rowmm_route for
+//!                                                 _rowmm_parts + _route_parts (tri_norm.gateRoute: the same bits;
+//!                                                 needs the kit's _rowmm_route; windows of up to 6 rows, fuse2_rows)
+//!   TF_DS_TP4_FILL=1                            a 2D node's wq_b, wo_a and wo_b take more K splits on a decode
+//!                                                 window of up to 16 rows (exl3_linear.planFor: the same kernel, a
+//!                                                 different fp32 partial-sum order). Default off: the plan, the
+//!                                                 launch and the bytes stay today's. TP2, world 1 and the drafter
+//!                                                 never set it, even when this is 1
+//!   TF_DS_TP4_FILL=exact                        the same three linears and the same window, at TP2's sk and wk and
+//!                                                 TP2's fp32 order, on exl3.glinear_mlp (exl3_mlp.hip: the register
+//!                                                 schedule picked per k2, wk). Default off. TP2, world 1 and the
+//!                                                 drafter never set it. An older kit without those symbols still
+//!                                                 loads; a rank with exact set refuses to open
+//!   TF_DS_TP4_FILL=exact_lds                    the same plan and the same fp32 order, on exl3.glinear_mlp_lds
+//!                                                 (trellis tiles parked in LDS). A (k2, wk) with no LDS symbol
+//!                                                 uses the register kernel. Default off. The same ranks as exact
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds TF_DS_POOL
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -33,6 +52,7 @@ const gpu = @import("gpu");
 const lanes = @import("lanes");
 const model = @import("model.zig");
 const lanes_mod = @import("lanes.zig");
+const cache_move = @import("cache_move.zig");
 const round = @import("round.zig");
 const draft_mod = @import("draft.zig");
 const link = @import("link.zig");
@@ -84,6 +104,8 @@ pub const Loaded = struct {
     lone: ?LoneRun = null,
     /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
     snaps: ?Snaps = null,
+    /// The prompt pass resumes and keeps prompts with images (lanes.zig keys their states by each picture's digest).
+    cache_images: bool = false,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     vision: ?lanes.stream.Vision = null,
     /// Structured output and required calls (the tokenizer's vocabulary read at open).
@@ -99,6 +121,15 @@ pub const Snaps = struct {
     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
     drop: *const fn (*anyopaque, *anyopaque) void,
+    /// Whether a kept state still restores for a prompt of that many tokens (lanes.zig snapRestoresFn); null: always.
+    restores: ?*const fn (*anyopaque, *anyopaque, u32) bool = null,
+    /// POST /cache/export and /cache/import: a kept state off the engine in sf-disk's layout and back (cache_move.zig).
+    export_state: ?*const fn (*anyopaque, *anyopaque, std.mem.Allocator, *[]u8, *[]u8) anyerror!void = null,
+    import_state: ?*const fn (*anyopaque, u32, []const u8, []const u8) anyerror!*anyopaque = null,
+    /// What the states look like on the wire (the identity namespace and sizes); null: no transfers.
+    shape: ?cache_move.Shape = null,
+    /// States are kept at chunk ends only (model.chunk_rows): the prompt cache lands its marks and shared cuts there.
+    grain: u32 = 0,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -204,8 +235,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
         .draft_ms = draft_cost,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
         .modalities = mods,
+        // a request's image tokens at most (serve.conf IMAGE_TOKENS; rank 1 --image-tokens, the same value)
+        .image_rows = if (nonEmpty(getenv("TF_DS_IMAGE_TOKENS"))) |v| try model.Model.parseImageRows(v) else model.Model.image_rows_reserved,
         .hip_kit = getenv("TF_DS_HIP_KIT") orelse if (gpu.backend == .hip) kernels else null, // HIP: the host's kit
-        .open_coll = if (gpu.backend == .hip) @import("tcp_coll.zig").open else null,
+        .open_coll = if (gpu.backend == .hip and try @import("comm.zig").chosen(world) == .tcp) @import("tcp_coll.zig").open else null, // HIP: TF_DS_COLL
         .disk = @import("disk.zig").wanted(world), // TF_DS_PROMPT_DISK_*: kept prompt states on disk (disk.zig)
     });
     errdefer st.m.close();
@@ -234,7 +267,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     st.encoder = null;
     if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
         const enc = try gpa.create(encoder_mod.Encoder);
-        enc.* = .init(gpa, io, v.encoderTower(), model.Model.image_rows_reserved);
+        enc.* = .init(gpa, io, v.encoderTower(), st.m.image_rows);
+        // the picture cache (serve.conf ENCODE_CACHE_MIB): rows kept by picture digest, unset 512 MiB, 0 off
+        enc.picture_cap = if (nonEmpty(getenv("TF_DS_ENCODE_CACHE_MIB"))) |x| encoder_mod.Encoder.parseCacheMib(x) catch |err| {
+            gpa.destroy(enc);
+            return err;
+        } else encoder_mod.default_picture_cache;
         enc.start() catch |err| {
             gpa.destroy(enc);
             return err;
@@ -244,14 +282,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     errdefer if (st.encoder) |enc| stopEncoder(gpa, enc);
     st.lanes.encoder = st.encoder;
     var hook: ?lanes.stream.Vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null;
-    if (hook) |*x| x.max_tokens = if (model.Model.image_rows_cap) |cap| @intCast(cap) else 0;
+    if (hook) |*x| x.max_tokens = if (st.m.imageRowsCap()) |cap| @intCast(cap) else 0;
     if (hook) |*x| if (st.encoder) |enc| {
         x.encode = enc.hook();
     };
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
+    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .restores = L.snapRestoresFn, .export_state = cache_move.exportFn, .import_state = cache_move.importFn, .shape = cache_move.shapeOf(gpa, st.m), .grain = model.chunk_rows };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .cache_images = true, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
 }
 
 fn stopEncoder(gpa: std.mem.Allocator, enc: *encoder_mod.Encoder) void {
@@ -293,7 +331,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoVisionKernels => "text_image on HIP needs the AMD kit's vision.* kernels (vision.hip): a kit built before them",
         error.NoVisionWeights => "text_image on HIP needs the vision tower's weights: TF_DS_VISION_DIR (a sidecar made by tools/dsv41-zig/kit/make_vision_sidecar.py) with model.safetensors.index.json",
         error.MissingVisionTensor, error.BadVisionTensor => "the vision weights (TF_DS_VISION_DIR) lack a tower tensor or hold one of another dtype or shape",
-        error.TooManyImageRows => std.fmt.comptimePrint("a request's images take at most {d} image tokens on this engine (four pictures at the largest size): send fewer or smaller images", .{model.Model.image_rows_reserved}),
+        error.TooManyImageRows => std.fmt.comptimePrint("a request's images take more image tokens than this engine reserved (serve.conf IMAGE_TOKENS, {d} unless set: four pictures at the largest size): send fewer or smaller images", .{model.Model.image_rows_reserved}),
+        error.BadImageTokens => std.fmt.comptimePrint("TF_DS_IMAGE_TOKENS (serve.conf IMAGE_TOKENS; rank 1 --image-tokens): a request's image tokens at most, a whole number from 1 to {d} (empty: {d}), the same on both ranks", .{ model.Model.image_rows_max, model.Model.image_rows_reserved }),
+        error.BadEncodeCache => "TF_DS_ENCODE_CACHE_MIB (serve.conf ENCODE_CACHE_MIB, rank 0): the picture cache's MiB, a whole number from 0 (off) to 65536 (empty: 512)",
         error.VisionUnsupported => "image input is not implemented on this backend: serve text only (TF_DS_MODALITIES=text)",
         error.BadModalities => "TF_DS_MODALITIES: text or text_image",
         error.NoCollective => "this build has no collectives transport for the ranks yet (HIP: w-link's TCP transport, model.Options.open_coll)",

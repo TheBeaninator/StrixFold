@@ -8,11 +8,7 @@ const Link = @import("link.zig").Link;
 
 /// The split of node `g` of `world` nodes: TP over 1 or 2, the 2D split over 4.
 pub fn split(g: u32, world: u32) !plan.Split {
-    return switch (world) {
-        1, 2 => .{ .rank = g, .world = world },
-        4 => .{ .rank = g % 2, .world = 2, .pair = g / 2 },
-        else => error.UnsupportedWorld,
-    };
+    return plan.Split.node(g, world);
 }
 
 /// How long each side waits for the other to link: rank 1 retries its connect while rank 0 loads, rank 0 waits for

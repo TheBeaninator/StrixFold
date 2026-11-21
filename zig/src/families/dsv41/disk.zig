@@ -1,4 +1,6 @@
-//! sf-disk for dsv41: kept prompt states (slot bytes, the extent's compressed rows in blocks) on disk on both TP ranks.
+//! sf-disk for dsv41: kept prompt states (slot bytes, the extent's compressed rows in blocks) on disk on every TP rank:
+//! a pair's two, or the four-node split's four (node g = 2p + r holds TP2 rank r's bytes; its identity carries rank=g
+//! world=4, so each node writes and reads its own namespace, and rank 0 decides for all three followers).
 const std = @import("std");
 const builtin = @import("builtin");
 const gpu = @import("gpu");
@@ -6,13 +8,14 @@ const core = @import("core");
 const model = @import("model.zig");
 const identity_mod = @import("disk_identity.zig");
 const pd = core.prompt_disk;
+const image_key = @import("lanes").image_key;
 const Key = pd.Key;
 const Model = model.Model;
 
 /// A block's positions: chunk_rows, shared by every state of a conversation.
 pub const block_tokens = model.chunk_rows;
 
-/// TF_DS_PROMPT_DISK_*, the same on both ranks (serve_lib.sh); the handshake carries " disk=1" when on.
+/// TF_DS_PROMPT_DISK_*, the same on every rank (serve_lib.sh); the handshake carries " disk=1" when on.
 pub const Settings = struct {
     dir: []const u8, // _DIR (default $HOME/strixfold-cache/prefix): one directory per identity below it
     budget: u64, // _GIB: disk for kept states on this box (unset, empty or 0: off)
@@ -59,9 +62,14 @@ pub fn envVar(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
 }
 
-/// Whether this build and launch may run the tier (the handshake's " disk=1"): HIP, TP2, the settings on.
+/// The worlds the tier runs at: a TP2 pair, or the four-node 2D split on a build that has it (gpu.features.world4).
+pub fn worldOk(world: u32) bool {
+    return world == 2 or (world == 4 and gpu.features.world4);
+}
+
+/// Whether this build and launch may run the tier (the handshake's " disk=1"): HIP, TP2 or TP4, the settings on.
 pub fn wanted(world: u32) bool {
-    if (gpu.backend != .hip or world != 2) return false;
+    if (gpu.backend != .hip or !worldOk(world)) return false;
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     return Settings.fromEnv(fba.allocator()) != null;
@@ -104,6 +112,27 @@ pub const Parts = identity_mod.Parts;
 pub const identityText = identity_mod.identityText;
 pub const seedText = identity_mod.seedText;
 
+/// pd.chain with each block's pictures: H_j also hashes (at, len, whole digest) of every span that meets block j.
+pub fn chainKeys(h0: Key, ids: []const u8, spans: []const image_key.KeySpan, out: []Key) void {
+    if (spans.len == 0) return pd.chain(h0, ids, block_tokens * 4, out);
+    std.debug.assert(out.len * block_tokens * 4 <= ids.len);
+    var prev = h0;
+    for (out, 0..) |*o, i| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(&prev);
+        h.update(ids[i * block_tokens * 4 ..][0 .. block_tokens * 4]);
+        for (spans) |sp| if (sp.at < (i + 1) * block_tokens and @as(usize, sp.at) + sp.len > i * block_tokens) {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u32, b[0..4], sp.at, .little);
+            std.mem.writeInt(u32, b[4..8], sp.len, .little);
+            h.update(&b);
+            h.update(&sp.digest);
+        };
+        o.* = h.finalResult();
+        prev = o.*;
+    }
+}
+
 /// One rank's tier: the store, the planes, the current prompt pass's chain of keys, and buffers for a resume.
 pub const Disk = struct {
     gpa: std.mem.Allocator,
@@ -119,7 +148,7 @@ pub const Disk = struct {
     streaming: bool = false, // rank 0: this pass writes its blocks as its chunks finish
     streamed: u32 = 0, // rank 0: blocks 1 .. streamed are planned in this pass
     stream_skips: u64 = 0,
-    peer_bad: u32 = 0, // rank 0: resumes in a row rank 1 found bad (10: the tier goes off)
+    peer_bad: u32 = 0, // rank 0: resumes in a row a follower found bad (10: the tier goes off)
     off: bool = false,
 
     /// The tier for this rank (owning s.dir from here), or null with one log line: it then stays off.
@@ -132,7 +161,7 @@ pub const Disk = struct {
     }
 
     fn openOr(gpa: std.mem.Allocator, m: *Model, s: Settings) !*Disk {
-        if (gpu.backend != .hip or m.world != 2) return error.NotTp2Hip;
+        if (gpu.backend != .hip or !worldOk(m.world)) return error.NotHipTp2OrTp4;
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const planes = try planesOf(gpa, m);
@@ -149,7 +178,7 @@ pub const Disk = struct {
         errdefer scratch.free();
         const d = try gpa.create(Disk);
         d.* = .{ .gpa = gpa, .m = m, .tier = tier, .settings = s, .planes = planes, .plane_bytes = pb, .h0 = pd.seed(seed_text), .scratch = scratch };
-        tier.line("event=open ns={s} states={d} blocks={d} mib={d} others_mib={d} budget_gib={d} block_bytes={d} slot_bytes={d} dir={s}", .{ &tier.ns_hex, tier.states.count(), tier.blocks.count(), tier.bytes >> 20, tier.others_bytes >> 20, s.budget >> 30, tier.block_bytes, tier.slot_bytes, s.dir });
+        tier.line("event=open ns={s} states={d} blocks={d} mib={d} others_mib={d} budget_gib={d} block_bytes={d} slot_bytes={d} free_mib={d} floor_mib={d} writable={} dir={s}", .{ &tier.ns_hex, tier.states.count(), tier.blocks.count(), tier.bytes >> 20, tier.others_bytes >> 20, s.budget >> 30, tier.block_bytes, tier.slot_bytes, tier.freeBytes() >> 20, s.floor >> 20, tier.writable(), s.dir });
         return d;
     }
 
@@ -163,14 +192,14 @@ pub const Disk = struct {
         d.gpa.destroy(d);
     }
 
-    /// A prompt pass begins on `ids` (rank 1: its sequence as rank 0 sent it): the keys of its whole blocks.
-    pub fn beginPass(d: *Disk, ids: []const u8) void {
+    /// A prompt pass begins on key ids `ids` with pictures `spans` (rank 1: as rank 0 sent them): its blocks' keys.
+    pub fn beginPass(d: *Disk, ids: []const u8, spans: []const image_key.KeySpan) void {
         const n = ids.len / 4 / block_tokens;
         d.chain.resize(d.gpa, n) catch {
             d.chain.clearRetainingCapacity();
             return;
         };
-        pd.chain(d.h0, ids, block_tokens * 4, d.chain.items);
+        chainKeys(d.h0, ids, spans, d.chain.items);
         d.passing = true;
         d.streaming = false;
         d.streamed = 0;
@@ -269,7 +298,7 @@ pub const Disk = struct {
         return .ok;
     }
 
-    /// The pair's outcome of a resume of `key`: a hit makes it the most recently used, a forget removes it here.
+    /// The ranks' outcome of a resume of `key`: a hit makes it the most recently used, a forget removes it here.
     pub fn finish(d: *Disk, key: Key, out: pd.Outcome) void {
         switch (out) {
             .hit => {
@@ -288,6 +317,27 @@ pub const Disk = struct {
         d.tier.line(fmt, args);
     }
 };
+
+/// A pass resumed from its kept state in memory at k blocks: that state's twin on disk (the same chain key) is touched as a
+/// disk resume touches it, so sf-disk's eviction order follows use on either tier. A state always resumed from memory (a
+/// shared expert prefix, a busy thread) would otherwise age on disk into the first victim, and read cold after a restart.
+/// True when a twin was on disk and touched (rank 0 only: its order decides the evictions its followers mirror).
+pub fn warmTwin(tier: *pd.Tier, chain: []const Key, k: u32) bool {
+    if (k == 0 or k > chain.len) return false;
+    const key = chain[k - 1];
+    if (!tier.hasComplete(key)) return false;
+    tier.touch(key);
+    return true;
+}
+
+/// The startup reconcile on rank 0: of its `keys` (its complete states), those not set in `have` (the bitmaps of
+/// every follower ANDed, lanes.syncAnswers), which every rank then drops (gpa).
+pub fn notOnEvery(gpa: std.mem.Allocator, keys: []const Key, have: []const u8) ![]Key {
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(gpa);
+    for (keys, 0..) |k, i| if (!pd.bit(have, i)) try out.append(gpa, k);
+    return out.toOwnedSlice(gpa);
+}
 
 /// The plan's runs to the writer, each from `copy(ctx, j, n)`; a failure abandons it with the runs queued (false).
 pub fn submitRuns(tier: *pd.Tier, p: *const pd.Plan, keys: []const Key, first_j: u32, state: bool, ctx: anytype, comptime copy: anytype) bool {

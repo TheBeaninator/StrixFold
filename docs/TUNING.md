@@ -57,3 +57,9 @@ for the others between slices. Beside three answering chats, a 100K prompt left 
 against 71 s when read whole, and itself took 76 s instead of 72. A shorter slice gives the others more rounds, down to
 one chunk a slice (where 500 and 1,000 already are); 2,000 reads a little faster and makes them wait up to 3 s. 0 reads
 every prompt whole.
+
+After a prompt read whole that took a second or more, the chats within `FINISH_LEFT` tokens of their `max_tokens`
+(256 unless set) answer before the next waiting prompt is read, 5 s at most, so a chat that is nearly done does not
+wait out every queued prompt. A request whose `max_tokens` is no more than that is within it from its first token:
+such chats then answer one at a time and never share a round. `FINISH_LEFT=0` waits for none: the waiting prompts are
+read first and their chats answer together.

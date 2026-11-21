@@ -82,6 +82,14 @@ pub const Split = struct {
     pub fn headCols(s: Split, c: Config) [2]usize {
         return s.part(s.range(s.vocab(c)), null);
     }
+    /// Node `g` of `world` nodes: TP over 1 or 2, the exact 2D split over 4 (node g = TP2 rank g % 2 of pair g / 2).
+    pub fn node(g: u32, world: u32) !Split {
+        return switch (world) {
+            1, 2 => if (g < world) .{ .rank = g, .world = world } else error.UnsupportedWorld,
+            4 => if (g < 4) .{ .rank = g % 2, .world = 2, .pair = g / 2 } else error.UnsupportedWorld,
+            else => error.UnsupportedWorld,
+        };
+    }
     /// The same split at pair `p` (a 2D node's partner in its column pair: the same TP2 rank, the other pair).
     pub fn atPair(s: Split, p: u32) Split {
         var o = s;
@@ -294,6 +302,15 @@ test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" 
     // its column partner, node 1
     try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1152, 1792 }, .dcols = .{ 0, 2560 } }, n3.atPair(0).expertParts(c));
     try eq([2]usize{ 4, 2 }, n3.atPair(0).woAGroups(c));
+}
+
+test "node g of world: TP over 1 or 2, the 2D split over 4, anything else refused" {
+    try std.testing.expectEqual(Split{ .rank = 1, .world = 2 }, try Split.node(1, 2));
+    try std.testing.expectEqual(Split{ .rank = 0, .world = 1 }, try Split.node(0, 1));
+    for (0..4) |g| try std.testing.expectEqual(Split{ .rank = @intCast(g % 2), .world = 2, .pair = @intCast(g / 2) }, try Split.node(@intCast(g), 4));
+    try std.testing.expectError(error.UnsupportedWorld, Split.node(4, 4));
+    try std.testing.expectError(error.UnsupportedWorld, Split.node(2, 2));
+    try std.testing.expectError(error.UnsupportedWorld, Split.node(0, 3));
 }
 
 test "the 2D split: node 2 (rank 0 of pair 1) keeps pair 1's blocks, DSpark stays TP2" {

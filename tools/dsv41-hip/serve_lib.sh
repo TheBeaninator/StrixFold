@@ -8,12 +8,63 @@ SERVE_CONF=${TF_SERVE_CONF:-$SERVE_TOOLS/serve.conf}
 
 die() { echo "$(basename "$0"): $*" >&2; exit 1; }
 
-# serve_load RANK: the config for RANK on this box (paths expanded with this box's $HOME and RANK).
+# serve_transport: the collectives' wire. tcp (COLL_KIND host or proxy) or rdma (rdma_proxy.zig, always kind rdma: one
+# QP a pair carries every gather that fits a slot, so there is no second proxy thread). A gather larger than a slot
+# goes through tcp_host under either transport (rdma_proxy.zig gatherBegin), so TP_STRIPE, COLL_STRIPE_MIB and
+# COLL_WIRE_THREADS shape those gathers under rdma as they do under tcp. rccl: comm.zig's Comm over RCCL (TF_DS_COLL=rccl),
+# one of the two wires of the four-node split (WORLD=4) beside rdma_proxy; tcp_coll and tcp_proxy are two-rank.
+# Under rccl COLL_KIND resolves to rccl and the COLL_* proxy settings do not apply.
+serve_transport() {
+  TRANSPORT=${TRANSPORT:-tcp} RDMA_DEV0=${RDMA_DEV0:-} RDMA_DEV1=${RDMA_DEV1:-} RDMA_IFNAME=${RDMA_IFNAME:-} RDMA_GID=${RDMA_GID:-3}
+  RCCL_LIB=${RCCL_LIB:-} RAIL_IFNAME=${RAIL_IFNAME:-}
+  case $TRANSPORT in
+    tcp) ;;
+    rccl)
+      COLL_KIND=rccl
+      [[ $RDMA_GID =~ ^[0-9]+$ ]] && [ "$RDMA_GID" -le 255 ] || die "RDMA_GID must be a GID index 0..255, not $RDMA_GID";;
+    rdma)
+      COLL_KIND=rdma
+      [ "${COLL_PROXY_STRIPE_KIB:-0}" = 0 ] || die "TRANSPORT=rdma: COLL_PROXY_STRIPE_KIB must be empty or 0 (no second proxy thread)"
+      if [ -n "$RDMA_DEV0$RDMA_DEV1" ]; then
+        [ -n "$RDMA_DEV0" ] && [ -n "$RDMA_DEV1" ] || die "TRANSPORT=rdma: RDMA_DEV0 and RDMA_DEV1 come together (both or neither)"
+      fi
+      [[ $RDMA_GID =~ ^[0-9]+$ ]] && [ "$RDMA_GID" -le 255 ] || die "RDMA_GID must be a GID index 0..255, not $RDMA_GID";;
+    *) die "TRANSPORT must be tcp, rdma or rccl, not $TRANSPORT";;
+  esac
+}
+
+# serve_nodes (WORLD=4): the four boxes, rank g = position g in NODES (tp4.conf). NODES, NODE_IPS (mgmt) and NODE_RAILS
+# (rail) have WORLD entries each, the letters distinct, and rank 0's rail address is MASTER_IP (it listens there: rank g
+# connects to TP_PORT + g - 1, fan.zig). Sets NODE, NODE_IP and NODE_RAIL for RANK, and RANK_HOST_<g> (the ssh name
+# first_light.sh uses from the driver box: RANK<g>_HOST when the conf sets it, else the mgmt address).
+serve_nodes() {
+  local -a n i r; read -ra n <<< "${NODES:-}"; read -ra i <<< "${NODE_IPS:-}"; read -ra r <<< "${NODE_RAILS:-}"
+  [ "${#n[@]}" = "$WORLD" ] && [ "${#i[@]}" = "$WORLD" ] && [ "${#r[@]}" = "$WORLD" ] ||
+    die "WORLD=$WORLD needs NODES, NODE_IPS and NODE_RAILS with $WORLD entries each (have ${#n[@]}, ${#i[@]}, ${#r[@]})"
+  [ "$(printf '%s\n' "${n[@]}" | sort -u | wc -l)" = "$WORLD" ] || die "NODES '${NODES}' names a box twice"
+  local g h
+  for g in "${!n[@]}"; do
+    [[ ${n[g]} =~ ^[A-Z]$ ]] || die "NODES: '${n[g]}' is not a node letter"
+    [[ ${i[g]} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ${r[g]} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+      die "NODE_IPS / NODE_RAILS: rank $g's addresses '${i[g]}' / '${r[g]}' are not IPv4 addresses"
+    h=RANK${g}_HOST; printf -v "RANK_HOST_$g" '%s' "${!h:-${i[g]}}"
+  done
+  [ "${r[0]}" = "$MASTER_IP" ] || die "MASTER_IP $MASTER_IP is not rank 0's rail address ${r[0]} (NODE_RAILS): ranks 1-3 connect there"
+  NODE=${n[RANK]} NODE_IP=${i[RANK]} NODE_RAIL=${r[RANK]}
+}
+
+# serve_load RANK: the config for RANK on this box (paths expanded with this box's $HOME, RANK, and at WORLD=4 HALF
+# (the TP2 rank r of node g = 2p + r: g % 2, whose Engram half the node holds) and PAIR (p = g / 2)).
 serve_load() {
   RANK=$1
   [ -f "$SERVE_CONF" ] || die "no config $SERVE_CONF"
   # shellcheck source=serve.conf
   source "$SERVE_CONF"
+  case ${WORLD:-} in 2|4) ;; *) die "WORLD must be 2 (the TP2 pair) or 4 (the four-node 2D split), not ${WORLD:-unset}";; esac
+  [[ $RANK =~ ^[0-9]$ ]] && [ "$RANK" -lt "$WORLD" ] || die "rank $RANK is not a rank of WORLD=$WORLD"
+  HALF=$((RANK % 2)) PAIR=$((RANK / 2))
+  NODE=${NODE:-} NODE_IP=${NODE_IP:-} NODE_RAIL=${NODE_RAIL:-}
+  [ "$WORLD" = 4 ] && serve_nodes
   DEPLOY_DIR_RAW=$DEPLOY_DIR  # unexpanded: another box's own $HOME (first_light.sh names rank 0's tools with it)
   local v
   # in this order: a path may name one expanded before it ($BUNDLE)
@@ -22,7 +73,12 @@ serve_load() {
   [ -n "${PROMPT_DISK_DIR:-}" ] && eval "PROMPT_DISK_DIR=\"$PROMPT_DISK_DIR\""
   # the image settings serve.conf describes and TEST_FAULT (TF_DS_TEST_FAULT, recovery tests); empty when not set
   VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-} MAX_IMAGES=${MAX_IMAGES:-}
+  IMAGE_TOKENS=${IMAGE_TOKENS:-} ENCODE_CACHE_MIB=${ENCODE_CACHE_MIB:-}
   [ -z "$MAX_IMAGES" ] || [[ $MAX_IMAGES =~ ^[1-9][0-9]*$ ]] || die "MAX_IMAGES must be an image count from 1 (empty: the server's 32), not $MAX_IMAGES"
+  [ -z "$IMAGE_TOKENS" ] || { [[ $IMAGE_TOKENS =~ ^[1-9][0-9]{0,5}$ ]] && [ "$IMAGE_TOKENS" -le 65536 ]; } ||
+    die "IMAGE_TOKENS must be a request's image tokens from 1 to 65536 (empty: the engine's 4096), not $IMAGE_TOKENS"
+  [ -z "$ENCODE_CACHE_MIB" ] || { [[ $ENCODE_CACHE_MIB =~ ^(0|[1-9][0-9]{0,4})$ ]] && [ "$ENCODE_CACHE_MIB" -le 65536 ]; } ||
+    die "ENCODE_CACHE_MIB must be the picture cache's MiB from 0 (off) to 65536 (empty: 512), not $ENCODE_CACHE_MIB"
   [ -n "$VISION_DIR" ] && eval "VISION_DIR=\"$VISION_DIR\""
   EDIT=${EDIT:-} EDIT_SHA256=${EDIT_SHA256:-}
   [ -n "$EDIT" ] && eval "EDIT=\"$EDIT\""
@@ -31,7 +87,9 @@ serve_load() {
   KIT=$DEPLOY_DIR/$KIT_SUBDIR
   [ "$PARALLEL" -ge 1 ] && [ "$PARALLEL" -le "$STREAMS" ] || die "PARALLEL $PARALLEL must be 1 .. STREAMS ($STREAMS)"
   local f size rows=
-  for f in rope-plain-cos rope-plain-sin rope-compressed-cos rope-compressed-sin; do
+  # (SERVE_PLAN=1, first_light.sh plan on another box: this box's files are not read; the rank's own check does it)
+  [ "${SERVE_PLAN:-0}" = 1 ] && rows=$((CONTEXT + 49))
+  [ "${SERVE_PLAN:-0}" = 1 ] || for f in rope-plain-cos rope-plain-sin rope-compressed-cos rope-compressed-sin; do
     size=$(stat -L -c %s "$DS_KIT/$f.f32" 2>/dev/null) || die "no RoPE table $DS_KIT/$f.f32 (DS_KIT)"
     [ -z "$rows" ] || [ $((size / 128)) -lt "$rows" ] && rows=$((size / 128))
   done
@@ -41,44 +99,61 @@ serve_load() {
   # share it while each request stays within CONTEXT (rank 0 TF_DS_POOL, rank 1 --pool; both ranks --context CONTEXT)
   POOL=${POOL:-$CONTEXT}
   [[ $POOL =~ ^[0-9]+$ ]] && [ "$POOL" -ge "$CONTEXT" ] || die "POOL $POOL must be a position count of at least CONTEXT ($CONTEXT)"
-  # the transport: tcp (COLL_KIND host or proxy) or rdma (rdma_proxy.zig; kind rdma, one QP per pair: no stripes)
-  TRANSPORT=${TRANSPORT:-tcp} RDMA_DEV0=${RDMA_DEV0:-} RDMA_DEV1=${RDMA_DEV1:-} RDMA_IFNAME=${RDMA_IFNAME:-} RDMA_GID=${RDMA_GID:-3}
-  case $TRANSPORT in
-    tcp) ;;
-    rdma)
-      COLL_KIND=rdma
-      [ -z "$TP_STRIPE" ] || die "TRANSPORT=rdma: TP_STRIPE must be empty (the rdma collective moves every gather over one QP)"
-      [ "${COLL_PROXY_STRIPE_KIB:-0}" = 0 ] || die "TRANSPORT=rdma: COLL_PROXY_STRIPE_KIB must be empty or 0 (no second proxy thread)"
-      if [ -n "$RDMA_DEV0$RDMA_DEV1" ]; then
-        [ -n "$RDMA_DEV0" ] && [ -n "$RDMA_DEV1" ] || die "TRANSPORT=rdma: RDMA_DEV0 and RDMA_DEV1 come together (both or neither)"
-      fi
-      [[ $RDMA_GID =~ ^[0-9]+$ ]] && [ "$RDMA_GID" -le 255 ] || die "RDMA_GID must be a GID index 0..255, not $RDMA_GID";;
-    *) die "TRANSPORT must be tcp or rdma, not $TRANSPORT";;
-  esac
-  case $COLL_KIND in host|proxy|rdma) ;; *) die "COLL_KIND must be host or proxy (over tcp), not $COLL_KIND";; esac
-  [ "$GRAPHS" = 0 ] || [ "$COLL_KIND" = proxy ] || [ "$COLL_KIND" = rdma ] || die "GRAPHS=1 needs COLL_KIND=proxy or TRANSPORT=rdma (tcp_host is not capturable)"
-  [ "$GRAPHS" = 0 ] || [ "$COLL_KIND" = host ] || [ $((ROUND_ROWS * 64640 * 4)) -le $((COLL_SLOT_KIB * 1024)) ] ||
-    die "GRAPHS=1: the head gather at ROUND_ROWS=$ROUND_ROWS ($((ROUND_ROWS * 64640 * 4)) B) exceeds COLL_SLOT_KIB=$COLL_SLOT_KIB"
+  serve_transport
+  [ "$WORLD" = 2 ] || [ "$TRANSPORT" = rccl ] || [ "$TRANSPORT" = rdma ] || die "WORLD=$WORLD needs TRANSPORT=rccl or rdma: tcp_coll and tcp_proxy are two-rank (rdma_proxy serves 4)"
+  case $COLL_KIND in host|proxy|rdma|rccl) ;; *) die "COLL_KIND must be host or proxy (over tcp), not $COLL_KIND";; esac
+  [ "$GRAPHS" = 0 ] || [ "$COLL_KIND" != host ] || die "GRAPHS=1 needs COLL_KIND=proxy, TRANSPORT=rdma or TRANSPORT=rccl (tcp_host is not capturable)"
+  if [ "$GRAPHS" != 0 ] && [ "$COLL_KIND" != host ] && [ "$COLL_KIND" != rccl ]; then
+    if [ "$WORLD" = 4 ]; then
+      # world 4 (rdma_proxy RdmaProxyN): a slot carries 4 blocks of at most the slot less four
+      # 64-byte trailers, split 4 ways, 64-byte aligned (rdma_core Layout.gatherChunk). The largest decode gather is the
+      # head's: this node's hw columns (253 of the 505 128-column blocks of the 64,640-wide vocab half = 32,384) x 4 B a
+      # row. A larger block still captures, but every graph replay then runs it as serialized slot chunks: refused here,
+      # with the COLL_SLOT_KIB that fits it.
+      local hb=$((ROUND_ROWS * 32384 * 4)) sb=$(( (COLL_SLOT_KIB * 1024 + 4095) / 4096 * 4096 )) ch need
+      ch=$(( (sb - 4 * 64) / 4 / 64 * 64 )); need=$(( (4 * hb + 4 * 64 + 4095) / 4096 * 4 ))
+      [ "$hb" -le "$ch" ] || die "GRAPHS=1 at WORLD=4: the head gather at ROUND_ROWS=$ROUND_ROWS is 4 blocks of $hb B, a COLL_SLOT_KIB=$COLL_SLOT_KIB slot carries blocks of $ch B, so every graph would run it as $(( (hb + ch - 1) / ch )) serialized slot chunks; set COLL_SLOT_KIB >= $need (rdma_proxy's world-4 default is 8704)"
+    else
+      [ $((ROUND_ROWS * 64640 * 4)) -le $((COLL_SLOT_KIB * 1024)) ] ||
+        die "GRAPHS=1: the head gather at ROUND_ROWS=$ROUND_ROWS ($((ROUND_ROWS * 64640 * 4)) B) exceeds COLL_SLOT_KIB=$COLL_SLOT_KIB"
+    fi
+  fi
+  # COLL_SWAP12=1 (TF_COLL_SWAP12, every rank alike: the handshake compares it): one-row quarters gathered straight into
+  # place (rdma_core Word.gatherSwap12, prompt2d quarters); rdma_proxy's per-peer path only
+  [ "${COLL_SWAP12:-0}" = 0 ] || { [ "$WORLD" = 4 ] && [ "$COLL_KIND" = rdma ]; } || die "COLL_SWAP12=1 needs WORLD=4 and TRANSPORT=rdma (rdma_proxy's four-rank gathers)"
   # (a configuration written before these settings existed runs with them off)
   SPAWN_UNIT=${SPAWN_UNIT:-0}
   case $SPAWN_UNIT in 0|1) ;; *) die "SPAWN_UNIT must be 0 or 1, not $SPAWN_UNIT";; esac
-  REPLAY_FLOOR=${REPLAY_FLOOR:-0} HC_SIDE=${HC_SIDE:-0} ENGRAM_AIO=${ENGRAM_AIO:-0} TOP_K_MAX=${TOP_K_MAX:-0} SEED_RANDOM=${SEED_RANDOM:-0}
-  L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-1} DRAFT_TEMPERATURE=${DRAFT_TEMPERATURE:-0}
+  REPLAY_FLOOR=${REPLAY_FLOOR:-0} PLACE_VICTIM=${PLACE_VICTIM:-0} HC_SIDE=${HC_SIDE:-0} ENGRAM_AIO=${ENGRAM_AIO:-0} TOP_K_MAX=${TOP_K_MAX:-0} SEED_RANDOM=${SEED_RANDOM:-0}
+  L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-1} DRAFT_TEMPERATURE=${DRAFT_TEMPERATURE:-0} GPU_COUNTS=${GPU_COUNTS:-0}
   [[ $DRAFT_TEMPERATURE =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v t="$DRAFT_TEMPERATURE" 'BEGIN { exit !(t <= 100) }' \
     || die "DRAFT_TEMPERATURE must be a number from 0 (off) to 100, not $DRAFT_TEMPERATURE"
   DRAFT_BYPASS_AT=${DRAFT_BYPASS_AT:-0}
   [[ $DRAFT_BYPASS_AT =~ ^(0|[2-8])$ ]] || die "DRAFT_BYPASS_AT must be 0 or 2..8"
   FILL_SLICE_MS=${FILL_SLICE_MS:-0}
   [[ $FILL_SLICE_MS =~ ^[0-9]{1,6}$ ]] || die "FILL_SLICE_MS must be a whole number of ms up to 999999 (0: whole prompt passes)"
+  [[ ${FINISH_LEFT:-} =~ ^[0-9]{0,6}$ ]] || die "FINISH_LEFT must be empty or a whole number of tokens up to 999999 (0: no stream is waited for)"
+  [[ ${QUEUE_MAX:-} =~ ^([0-9]{1,6}|off)?$ ]] || die "QUEUE_MAX must be empty, a whole number of requests up to 999999, or off"
+  [[ ${QUEUE_MIB:-} =~ ^([0-9]{1,7}|off)?$ ]] || die "QUEUE_MIB must be empty, a whole number of MiB up to 9999999, or off"
+  [[ ${QUEUE_RETRY_S:-} =~ ^[0-9]{0,4}$ ]] || die "QUEUE_RETRY_S must be empty or a whole number of seconds up to 9999"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
-  for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
+  for v in REPLAY_FLOOR PLACE_VICTIM GPU_COUNTS HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
   # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
   [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
+  # the disk tier runs at WORLD 2 and 4 (each rank keeps its own key.r<g>);
+  # learned states (LEARN_DIR) stay TP2-only: at another WORLD they stay off with one line
+  if serve_disk_on && [ "$WORLD" != 2 ] && [ "$WORLD" != 4 ]; then
+    echo "serve_lib: rank $RANK: PROMPT_DISK_GIB=$PROMPT_DISK_GIB off at WORLD=$WORLD (the disk tier runs at WORLD 2 and 4)" >&2
+    PROMPT_DISK_GIB=0
+  fi
+  if [ -n "${LEARN_DIR:-}" ] && [ "$WORLD" != 2 ]; then
+    echo "serve_lib: rank $RANK: LEARN_DIR=$LEARN_DIR off at WORLD=$WORLD (learned prompt states are TP2-only until the world-4 disk tier)" >&2
+    LEARN_DIR= LEARN_GIB=
+  fi
   if serve_disk_on; then
     awk -v g="${PROMPT_CACHE_GIB:-0}" 'BEGIN { exit !(g > 0) }' || die "PROMPT_DISK_GIB=$PROMPT_DISK_GIB needs PROMPT_CACHE_GIB > 0 (the disk tier writes the kept states)"
-    [ "$WORLD" = 2 ] || die "PROMPT_DISK_GIB: the disk tier runs on the TP2 pair (WORLD=2)"
     local k
     for k in PROMPT_DISK_FLOOR_GIB PROMPT_DISK_QUEUE_MIB PROMPT_DISK_MIN_TOKENS PROMPT_DISK_RATE_MIB; do
       [ -z "${!k:-}" ] || [[ ${!k} =~ ^[0-9]+$ ]] || die "$k must be a whole number, not ${!k}"
@@ -145,6 +220,7 @@ if need_report == "1":
                  f"{r.get('manifest_sha256', 'not recorded')}; wanted pass for rank {rank} and manifest {sha}")
 PY
   [ "$TRANSPORT" = rdma ] && serve_rdma_check
+  [ "$TRANSPORT" = rccl ] && serve_rccl_check
   return 0
 }
 
@@ -161,6 +237,32 @@ serve_rdma_check() {
     die "rank $RANK: the rdma check failed on $(hostname) (rdma_check.py above)"
 }
 
+# serve_rail_ifname / serve_rail_hca (TRANSPORT=rccl): the rail's interface (RAIL_IFNAME, else the one holding this
+# rank's rail address: NODE_RAIL at WORLD=4, MASTER_IP for rank 0 of a pair) and its RDMA device (RDMA_DEV<rank>, else
+# the box's only ibdev), for NCCL_SOCKET_IFNAME and NCCL_IB_HCA. Under SERVE_PLAN=1 (another box) they are named, not read.
+serve_rail_ifname() {
+  local a=${NODE_RAIL:-$MASTER_IP}
+  [ -n "$RAIL_IFNAME" ] && { echo "$RAIL_IFNAME"; return; }
+  [ "${SERVE_PLAN:-0}" = 1 ] && { echo "<iface-of-$a>"; return; }
+  ip -4 -o addr show | awk -v a="$a" '{ split($4, p, "/"); if (p[1] == a) { print $2; exit } }'
+}
+serve_rail_hca() {
+  local dv=RDMA_DEV$RANK d
+  [ -n "${!dv:-}" ] && { echo "${!dv}"; return; }
+  [ "${SERVE_PLAN:-0}" = 1 ] && { echo "<only-ibdev-on-${NODE:-rank$RANK}>"; return; }
+  d=$(ls /sys/class/infiniband 2>/dev/null)
+  [ "$(wc -w <<< "$d")" = 1 ] && echo "$d"
+}
+
+# serve_rccl_check (TRANSPORT=rccl): the library, the rail interface and device resolve on this box, and memlock is
+# unlimited (RCCL registers its buffers: ibv_reg_mr fails under a limit, the rail recipe's LimitMEMLOCK=infinity).
+serve_rccl_check() {
+  [ -z "$RCCL_LIB" ] || [ -f "$RCCL_LIB" ] || die "rank $RANK: RCCL_LIB $RCCL_LIB is not on $(hostname)"
+  [ -n "$(serve_rail_ifname)" ] || die "rank $RANK: no interface holds the rail address ${NODE_RAIL:-$MASTER_IP} on $(hostname) (RAIL_IFNAME)"
+  [ -n "$(serve_rail_hca)" ] || die "rank $RANK: no single RDMA device on $(hostname) (RDMA_DEV$RANK names one)"
+  [ "$(ulimit -l)" = unlimited ] || die "rank $RANK: memlock is $(ulimit -l) KiB on $(hostname); RCCL needs unlimited (LimitMEMLOCK=infinity)"
+}
+
 # serve_idle (U25): this box is idle before a rank starts: no other engine process, and MemAvailable at least the
 # rank's peak (PEAK_GIB) plus 8 GiB.
 serve_idle() {
@@ -174,31 +276,73 @@ serve_idle() {
 # serve_env: SERVE_ENV, the rank's whole environment (env -i starts it with exactly this).
 serve_env() {
   SERVE_ENV=(HOME="$HOME" USER="${USER:-}" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8
-    TF_GPU_STRICT="$GPU_STRICT" TF_HIP_DEVICE="$HIP_DEVICE" TENSORFOLD_HIP_MEMORY_LIMIT_GB="$MEMORY_LIMIT_GB"
+    TF_GPU_STRICT="$GPU_STRICT" TF_GPU_COUNTS="$GPU_COUNTS" TF_HIP_DEVICE="$HIP_DEVICE" TENSORFOLD_HIP_MEMORY_LIMIT_GB="$MEMORY_LIMIT_GB"
     TF_DS_MODALITIES="$MODALITIES" TF_DS_GRAPHS="$GRAPHS" TF_DS_ARENA_GIB="$ARENA_GIB"
     TF_COLL_STRIPE_MIB="$COLL_STRIPE_MIB" TF_COLL_RTO_MIN_US="$COLL_RTO_MIN_US" TF_COLL_PROGRESS_MS="$COLL_PROGRESS_MS"
-    TF_COLL_STAGING="$COLL_STAGING" TF_COLL_KIND="$COLL_KIND" TF_DS_AUX="$AUX" TF_DS_REPLAY_FLOOR="$REPLAY_FLOOR")
+    TF_COLL_STAGING="$COLL_STAGING" TF_COLL_KIND="$COLL_KIND" ${AUX:+"TF_DS_AUX=$AUX"} TF_DS_REPLAY_FLOOR="$REPLAY_FLOOR"
+    TF_DS_PLACE_VICTIM="$PLACE_VICTIM")
+  # (TF_DS_AUX only when AUX is set: unset = hip in tri_aux.Which.fromEnv, and an empty value is BadSetting at load)
   # the proxy settings serve both slot collectives (tcp_proxy and rdma_proxy); the stripe thread is tcp_proxy's only
   case $COLL_KIND in proxy|rdma) SERVE_ENV+=(TF_COLL_PROXY_CPU="$COLL_PROXY_CPU" TF_COLL_SLOT_KIB="$COLL_SLOT_KIB");; esac
+  [ "${COLL_SWAP12:-0}" = 1 ] && SERVE_ENV+=(TF_COLL_SWAP12=1)
+  # CLOCK_MARKS (TF_DS_CLOCK_MARKS, every rank): with tf-dsv41-lanes --profile, GPU clocks at the round phase marks (lanes_main.zig)
+  [ -n "${CLOCK_MARKS:-}" ] && SERVE_ENV+=(TF_DS_CLOCK_MARKS="$CLOCK_MARKS")
   [ "$COLL_KIND" = proxy ] && SERVE_ENV+=(TF_COLL_PROXY_STRIPE_KIB="${COLL_PROXY_STRIPE_KIB:-0}" TF_COLL_PROXY_CPU2="${COLL_PROXY_CPU2:-7}")
+  # RCCL (the RCCL rail recipe): the rail interface and device, RoCE v2 GID, GPU-direct via dma-buf
+  if [ "$TRANSPORT" = rccl ]; then
+    SERVE_ENV+=(TF_DS_COLL=rccl NCCL_SOCKET_IFNAME="$(serve_rail_ifname)" NCCL_IB_HCA="$(serve_rail_hca)" NCCL_IB_GID_INDEX="$RDMA_GID"
+      NCCL_NET_GDR_LEVEL=SYS NCCL_NET_GDR_READ=1 NCCL_DMABUF_ENABLE=1 NCCL_DEBUG="${NCCL_DEBUG:-WARN}")
+    [ -n "$RCCL_LIB" ] && SERVE_ENV+=(TF_RCCL_LIB="$RCCL_LIB")
+  fi
   if [ "$TRANSPORT" = rdma ]; then
-    SERVE_ENV+=(TF_RDMA_GID_INDEX="$RDMA_GID")
-    [ -n "$RDMA_DEV0" ] && SERVE_ENV+=(TF_RDMA_DEVICES="$RDMA_DEV0,$RDMA_DEV1")   # rank order: rank 0's, rank 1's
+    # TF_DS_COLL=tcp: the model takes the transport handed in (tcp_coll.open, which with TF_COLL_KIND=rdma opens
+    # rdma_proxy: two ranks, or RdmaProxyN at world 3-4), not RCCL (comm.zig chosen; the world-4 default is RCCL)
+    SERVE_ENV+=(TF_DS_COLL=tcp TF_RDMA_GID_INDEX="$RDMA_GID")
+    if [ "$WORLD" = 4 ]; then
+      # world 4: each rank names its own device, one name (RDMA_DEV<rank>, else the box's only rail
+      # device: serve_rail_hca), or without RDMA_DEV<g> its rail interface. A two-name list covers ranks 0 and 1
+      # only: rank_nic's "names no device for rank 2", BadSetting at load
+      [ -z "$RDMA_DEV0$RDMA_IFNAME" ] && SERVE_ENV+=(TF_RDMA_IFNAME="$(serve_rail_ifname)")
+      [ -n "$RDMA_DEV0" ] && SERVE_ENV+=(TF_RDMA_DEVICES="$(serve_rail_hca)")
+    else
+      [ -n "$RDMA_DEV0" ] && SERVE_ENV+=(TF_RDMA_DEVICES="$RDMA_DEV0,$RDMA_DEV1")   # rank order: rank 0's, rank 1's
+    fi
     [ -n "$RDMA_IFNAME" ] && SERVE_ENV+=(TF_RDMA_IFNAME="$RDMA_IFNAME")
   fi
   [ -n "${COLL_GPU_WAIT_S:-}" ] && SERVE_ENV+=(TF_COLL_GPU_WAIT_S="$COLL_GPU_WAIT_S")  # (a conf without them: the engine's)
   [ -n "${MEMORY_RESERVE_GIB:-}" ] && SERVE_ENV+=(TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB")
   [ -n "${COLL_GPU_WARN_S:-}" ] && SERVE_ENV+=(TF_COLL_GPU_WARN_S="$COLL_GPU_WARN_S")
+  # COLL_TIME (1 or sync; unset or empty: off): TF_DS_COLL_TIME, rank 0's per-kind collective time on its lanes lines (coll.Timer)
+  [ -n "${COLL_TIME:-}" ] && SERVE_ENV+=(TF_DS_COLL_TIME="$COLL_TIME")
   [ -n "$TP_DATA_PORT" ] && SERVE_ENV+=(TF_TP_DATA_PORT="$TP_DATA_PORT")
   [ -n "$TP_STRIPE" ] && SERVE_ENV+=(TF_TP_STRIPE="$TP_STRIPE")
+  if [ -n "${COLL_WIRE_THREADS:-}" ]; then
+    case $COLL_WIRE_THREADS in 1|2) ;; *) die "COLL_WIRE_THREADS must be 1 or 2 (empty: the engine's 1), not $COLL_WIRE_THREADS";; esac
+    [ "$COLL_WIRE_THREADS" = 1 ] || [ -n "$TP_STRIPE" ] || die "COLL_WIRE_THREADS=2 needs TP_STRIPE (a second data link for the second thread)"
+    SERVE_ENV+=(TF_COLL_WIRE_THREADS="$COLL_WIRE_THREADS")
+  fi
   [ -n "$ROUND_MS" ] && SERVE_ENV+=(TF_DS_ROUND_MS="$ROUND_MS")
   [ -n "$DRAFT_MS" ] && SERVE_ENV+=(TF_DS_DRAFT_MS="$DRAFT_MS")
   [ -n "${FIX_K:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_FIX_K="$FIX_K")
   [ -n "${FROZEN_TIMING:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_LANES_FROZEN_TIMING="$FROZEN_TIMING")
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_DRAFT_BYPASS_AT="$DRAFT_BYPASS_AT")
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_FILL_SLICE_MS="$FILL_SLICE_MS")
+  [ -n "${FINISH_LEFT:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_FINISH_LEFT="$FINISH_LEFT")
+  # the server's cap on waiting requests and the bytes they hold, rank 0 only (its HTTP side)
+  [ -n "${QUEUE_MAX:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_QUEUE_MAX="$QUEUE_MAX")
+  [ -n "${QUEUE_MIB:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_QUEUE_MIB="$QUEUE_MIB")
+  [ -n "${QUEUE_RETRY_S:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_QUEUE_RETRY_S="$QUEUE_RETRY_S")
   [ -n "${TRACE_ROUNDS:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_TRACE_ROUNDS="$TRACE_ROUNDS")
   [ -n "${GRAPHS_EAGER:-}" ] && SERVE_ENV+=(TF_DS_GRAPHS_EAGER="$GRAPHS_EAGER")
+  # the fused hc chain, read by Round.init on every rank (round.zig), so both ranks get it
+  [ -n "${HC_CHAIN:-}" ] && SERVE_ENV+=(TF_HC_CHAIN="$HC_CHAIN")
+  # the fused router launch, read by Round.init on every rank
+  [ -n "${FUSE2:-}" ] && SERVE_ENV+=(TF_FUSE2="$FUSE2")
+  # TF_DS_TP4_FILL, read by the weights loader on every rank (a 2D node's halved attention linears)
+  [ "${TP4_FILL:-0}" = 0 ] || SERVE_ENV+=(TF_DS_TP4_FILL="$TP4_FILL")
+  # TF_DS_VGATHER, read when the world-4 collective opens (every rank). 1 = a multi-row
+  # equal-width quarters is assembled with two copy_rows16; the all-gather is the one issued with it off.
+  [ "${VGATHER:-0}" = 0 ] || SERVE_ENV+=(TF_DS_VGATHER="$VGATHER")
   # the prefetch's forked stream overlaps the graph's main branch only with HIP's segment scheduling (a debug variable)
   [ "$L2_PREFETCH" = 1 ] && SERVE_ENV+=(DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1)
   # the split doubles Chunk's cap-independent buffers (+474 MB at 16K, +0.62-0.68 GiB per rank at 63,488): serve.conf keeps it on (PREFILL_SPLIT_LARGE=1); LARGE=0 clears it above 16384
@@ -208,6 +352,11 @@ serve_env() {
   fi
   [ -n "${PREFILL_SPLIT:-}" ] && SERVE_ENV+=(TF_DS_PREFILL_SPLIT="$PREFILL_SPLIT")
   [ -n "${PREFILL_SPLIT_ZIP:-}" ] && SERVE_ENV+=(TF_DS_PREFILL_SPLIT_ZIP="$PREFILL_SPLIT_ZIP")
+  # both ranks alike (the handshake compares it); never dropped here: without the split the engine refuses it (BadSetting)
+  if [ -n "${PREFILL_ZIP2:-}" ] && [ "$PREFILL_ZIP2" != 0 ]; then
+    [ -n "${PREFILL_SPLIT:-}" ] || echo "serve_lib: PREFILL_ZIP2=$PREFILL_ZIP2 without PREFILL_SPLIT: the engine will refuse it" >&2
+    SERVE_ENV+=(TF_DS_PREFILL_ZIP2="$PREFILL_ZIP2")
+  fi
   [ -n "${LOGITS_SHA:-}" ] && SERVE_ENV+=(TF_DS_LOGITS_SHA="$LOGITS_SHA")
   [ -n "${WINDOW_LOGITS:-}" ] && SERVE_ENV+=(TF_DS_WINDOW_LOGITS="$WINDOW_LOGITS")
   # sf-disk, both ranks alike (the handshake compares " disk=1"); nothing at all when off
@@ -221,14 +370,20 @@ serve_env() {
     [ -n "${PROMPT_DISK_RATE_MIB:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_RATE_MIB="$PROMPT_DISK_RATE_MIB")
   fi
   [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_VISION_DIR="$VISION_DIR")
+  # (empty: unset, the engine's 4096; rank 1 has it as --image-tokens, serve_lanes_cmd)
+  [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && [ -n "${IMAGE_TOKENS:-}" ] && SERVE_ENV+=(TF_DS_IMAGE_TOKENS="$IMAGE_TOKENS")
+  [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && [ -n "${ENCODE_CACHE_MIB:-}" ] && SERVE_ENV+=(TF_DS_ENCODE_CACHE_MIB="$ENCODE_CACHE_MIB")
+  # python3 -I (the server's Pillow child, pil.zig) ignores PYTHONPATH: a Pillow shipped in the deploy (pylib/) comes by TF_PIL_PATH
+  [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && [ -d "$DEPLOY_DIR/pylib/PIL" ] && SERVE_ENV+=(TF_PIL_PATH="$DEPLOY_DIR/pylib")
   [ -n "$TEST_FAULT" ] && SERVE_ENV+=(TF_DS_TEST_FAULT="$TEST_FAULT")
   [ -n "$EDIT" ] && SERVE_ENV+=(TF_DS_EDIT="$EDIT")
   # the launch's identity in the peers' handshake (U46): the deployed commit, the bundle's and serve.conf's hashes
-  local commit
-  commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$DEPLOY_DIR/DEPLOY.json")
+  local commit=PLAN:DEPLOY.json-commit-on-the-box
+  [ "${SERVE_PLAN:-0}" = 1 ] ||
+    commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$DEPLOY_DIR/DEPLOY.json")
   SERVE_ENV+=(TF_DS_DEPLOY="$commit" TF_DS_BUNDLE="$BUNDLE_SHA256" TF_DS_CONF="$(sha256sum "$SERVE_CONF" | cut -d' ' -f1)")
-  # rank 1's run dir, where first_light.sh down leaves its stop marker (exit 0 on a stop, 1 on a lost peer)
-  [ "$RANK" = 1 ] && [ -n "${RUN:-}" ] && SERVE_ENV+=(TF_TFP_RUN="$RUN")
+  # a follower's run dir (ranks 1-3), where first_light.sh down leaves its stop marker (exit 0 on a stop, 1 on a lost peer)
+  [ "$RANK" != 0 ] && [ -n "${RUN:-}" ] && SERVE_ENV+=(TF_TFP_RUN="$RUN")
   if [ "$RANK" = 0 ]; then
     SERVE_ENV+=(TF_TP_WORLD="$WORLD" TF_TP_MASTER="$MASTER_IP" TF_TP_PORT="$TP_PORT" TF_DS_RANK_CACHE="$RANK_CACHE"
       TF_DS_KIT="$DS_KIT" TF_DS_ENGRAM="$ENGRAM_DIR" TF_DS_TOKEN_MAP="$TOKEN_MAP" TF_DS_STREAMS="$STREAMS"
@@ -246,6 +401,8 @@ serve_lanes_cmd() {
     --arena-gib "$ARENA_GIB" --graphs "$GRAPHS" --side "$HC_SIDE" --aio "$ENGRAM_AIO" --prefetch "$L2_PREFETCH")
   [ -n "$ROUND_MS" ] && SERVE_CMD+=(--round-ms "$ROUND_MS")
   [ -n "$DRAFT_MS" ] && SERVE_CMD+=(--draft-ms "$DRAFT_MS")
+  # (empty: the flag is left out, the engine's 4096: the argv of a build without it)
+  [ "$MODALITIES" = text_image ] && [ -n "${IMAGE_TOKENS:-}" ] && SERVE_CMD+=(--image-tokens "$IMAGE_TOKENS")
   return 0
 }
 
@@ -265,6 +422,8 @@ serve_cmd() {
     [ "$DRAFTS" = 1 ] || SERVE_CMD+=(--no-drafts)
     # (empty: the flag is left out, the server's default)
     [ -z "$MAX_IMAGES" ] || SERVE_CMD+=(--vision-max-images "$MAX_IMAGES")
+    # (empty or unset: the /cache routes are absent; the key file is read once, at the server's start)
+    [ -z "${CACHE_TRANSFER_KEY:-}" ] || SERVE_CMD+=(--cache-transfer-key "$CACHE_TRANSFER_KEY")
   else
     serve_lanes_cmd
     [ -n "${LOGITS_SHA:-}" ] && SERVE_CMD+=(--logits-sha "$LOGITS_SHA")

@@ -1,6 +1,7 @@
 //! The dsv41 family built for HIP (zig build test-dsv41-hip-host): a HIP rank's whole serving path is analyzed from its
 //! entry points (native.open, which builds the lane backend over every model primitive, its refusals and weight check),
-//! so anything it reaches must compile without CUDA, NCCL or verbs (its vision tower is vit_hip.zig on the AMD kit, no
+//! so anything it reaches must compile without CUDA, NVIDIA's NCCL or verbs (its collectives are w-link's TCP or RCCL,
+//! gpu/hip/rccl.zig; its vision tower is vit_hip.zig on the AMD kit, no
 //! cubin, cuBLAS or torch kernel); then the tests of the files it uses run on the host (no GPU work).
 const std = @import("std");
 const gpu = @import("gpu");
@@ -8,7 +9,7 @@ const native = @import("native.zig");
 const model = @import("model.zig");
 
 test "a HIP rank's serving path, vision included, compiles without CUDA, NCCL or verbs RDMA" {
-    comptime std.debug.assert(gpu.backend == .hip and gpu.features.vision and !gpu.features.verbs_rdma and !gpu.features.world4);
+    comptime std.debug.assert(gpu.backend == .hip and gpu.features.vision and !gpu.features.verbs_rdma and gpu.features.world4);
     _ = &native.open;
     _ = &native.explain;
     _ = &native.weightBytes;
@@ -30,12 +31,22 @@ test "the text capability stays a HIP rank's default; text_image is asked for" {
 test {
     // the host tests of the files a HIP rank uses
     _ = @import("coll.zig");
+    _ = @import("comm.zig");
+    _ = @import("cache_move.zig");
     _ = @import("model.zig");
     _ = @import("tcp_wire.zig");
     _ = @import("tcp_coll.zig");
     _ = @import("tcp_proxy.zig");
     _ = @import("rdma_proxy.zig");
     _ = @import("fan.zig");
+    // world 4: the four-node 2D split (prompt2d.zig and its decode, drafter and expert parts; ring2d compiles out)
+    _ = @import("link_fake.zig");
+    _ = @import("prompt2d.zig");
+    _ = @import("prompt2d_test.zig");
+    _ = @import("round2d.zig");
+    _ = @import("draft2d.zig");
+    _ = @import("exl3_experts2d.zig");
+    _ = @import("exl3_experts2d_rec.zig");
     _ = @import("config.zig");
     _ = @import("plan.zig");
     _ = @import("rank_cache.zig");
@@ -65,9 +76,11 @@ test {
     _ = @import("stop_marker.zig");
     _ = @import("disk.zig");
     _ = @import("disk_test.zig");
+    _ = @import("fill_spans.zig");
     _ = @import("native.zig");
     _ = @import("hipblas.zig");
     _ = @import("hip_load.zig");
+    _ = @import("exl3_linear.zig");
     _ = @import("vision.zig");
     _ = @import("vit_hip.zig");
     _ = @import("encoder.zig");

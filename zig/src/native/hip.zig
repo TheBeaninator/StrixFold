@@ -154,6 +154,7 @@ const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    cache_images: bool = false, // the family resumes and keeps prompts with images (its pass keys them by picture)
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
 
     fn close(p: *anyopaque) void {
@@ -195,10 +196,14 @@ const Host = struct {
         // TF_FILL_SLICE_MS=N: a prompt pass reads N ms of chunks between the decoding streams' rounds (0: whole passes)
         var served = info;
         if (getenv("TF_FILL_SLICE_MS")) |v| served.fill_slice_ns = std.math.mul(u64, try std.fmt.parseInt(u64, v, 10), std.time.ns_per_ms) catch return error.Overflow;
+        // TF_FINISH_LEFT=N: after a long whole prompt pass, streams within N tokens of their max_tokens decode before the
+        // next request's pass (unset: 256; 0: none is waited for, queued passes read first and their streams share rounds)
+        if (getenv("TF_FINISH_LEFT")) |v| served.finish_left = try std.fmt.parseInt(u32, v, 10);
         h.host = api.LaneHost.init(h.gpa, io, &h.core, served);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        h.host.cache_images = h.cache != null and h.cache_images;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -385,7 +390,20 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
         if (want > 0) {
             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
+            // a family whose kept states can lose their rows (a shared pool) says which still restore
+            if (@hasField(@TypeOf(sn), "restores")) h.snap_vt.restores = sn.restores;
+            // a family whose states move (POST /cache/export, /cache/import): its copies, and their wire shape
+            if (@hasField(@TypeOf(sn), "export_state")) {
+                h.snap_vt.export_state = sn.export_state;
+                h.snap_vt.import_state = sn.import_state;
+            }
+            // a family that keeps only at its chunk ends says so (grain)
+            const rules: api.prompt_cache.Rules = .{ .grain = if (@hasField(@TypeOf(sn), "grain")) sn.grain else 0 };
+            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, rules, want);
+            if (@hasField(@TypeOf(sn), "shape")) if (sn.shape) |sh| {
+                h.cache.?.shape = .{ .ns = sh.ns, .block_tokens = sh.block_tokens, .max_blocks = sh.max_blocks, .max_positions = sh.max_positions, .slot_bytes = sh.slot_bytes, .block_bytes = sh.block_bytes };
+            };
+            h.cache_images = @hasField(@TypeOf(loaded), "cache_images") and loaded.cache_images;
         }
     };
     // text only on HIP (D13): the family hands no vision hook, so the server refuses image parts
@@ -396,7 +414,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const served_window: i64 = if (@hasField(@TypeOf(loaded), "context_window")) (if (loaded.context_window) |w| @intCast(w) else window) else window;
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(served_window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .structures = structures, .top_k_max = if (@hasDecl(F, "top_k_max")) F.top_k_max else 0, .needs_top_k = @hasDecl(F, "needs_top_k") and F.needs_top_k }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+    // raw_exit: the OpenMP runtime hipBLAS brought stays loaded after the close, and its fini faults in libc exit()
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .raw_exit = true };
 }
 
 /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
@@ -444,4 +463,8 @@ test "the default device limit leaves the host its share of a 128 GiB Strix Halo
     const p: Pool = .{ .free = 120 * g, .total = 128 * g, .reserve = try budget.reserveBytes(null, 128 * g), .limit = default_limit, .unified = true };
     try std.testing.expectEqual(p.free - p.reserve, p.room(0));
     try std.testing.expectEqual(@as(u64, 10 * g), p.room(100 * g));
+}
+
+test {
+    _ = @import("dsv41_keep_replay_test.zig");
 }

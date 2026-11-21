@@ -24,10 +24,16 @@ pub const act_f32 = 1; // ACT_F32
 pub const prep_threads = 256; // experts.cu PREP_THREADS
 pub const decode_stages = 3; // DECODE_STAGES: each warp's ring of trellis copies in grouped_cp_kernel (its S)
 
-/// A K2 range's template: (8, 8), (2, 10) or (2, 16), as every grouped launcher picks it.
+/// The grouped kernels' K2 range templates: (8, 8), (2, 10), (2, 16) and (8, 12).
+pub const ranges = 4;
+
+/// A K2 range's template as every grouped launcher picks it: (8, 8), (2, 10), (8, 12) (a 4.0 bpw layer: routed K2 8
+/// with the K2 12 shared expert; the MTP blocks' sets), else the generic (2, 16). A kit or cubin without the (8, 12)
+/// template serves that range with (2, 16)'s kernels (Kernels.fallback), which take any K2 of 2..16.
 pub fn range(lo: u32, hi: u32) usize {
     if (lo == 8 and hi == 8) return 0;
     if (lo >= 2 and hi <= 10) return 1;
+    if (lo >= 8 and hi <= 12) return 3;
     return 2;
 }
 
@@ -59,9 +65,9 @@ pub const Kernels = struct {
     gateup_epilogue: gpu.Function,
     down_combine: gpu.Function,
     decode_prep: gpu.Function, // <__nv_bfloat16>
-    mma: [3]?gpu.Function = @splat(null), // grouped_mma_kernel<CB, LO, HI, FOLD true, KB 4> by range()
-    rows: [3]?gpu.Function = @splat(null), // grouped_rows_kernel<CB, 8, 4, 1, LO, HI, 2, FOLD false> by range()
-    cp: [3][2]?gpu.Function = @splat(@splat(null)), // grouped_cp_kernel<CB, 8, 4, 3, LO, HI, EPI> by range(), EPI - 1
+    mma: [ranges]?gpu.Function = @splat(null), // grouped_mma_kernel<CB, LO, HI, FOLD true, KB 4> by range()
+    rows: [ranges]?gpu.Function = @splat(null), // grouped_rows_kernel<CB, 8, 4, 1, LO, HI, 2, FOLD false> by range()
+    cp: [ranges][2]?gpu.Function = @splat(@splat(null)), // grouped_cp_kernel<CB, 8, 4, 3, LO, HI, EPI> by range(), EPI - 1
     /// The AMD kit's prompt experts (exl3.pf_experts.*, hip_load.zig); null in a CUDA build or a kit without them.
     pf: ?Pf = null,
     /// The functions are the AMD kit's (hip_load.zig): unload leaves its modules alone.
@@ -117,7 +123,20 @@ pub const Kernels = struct {
                 k.cp[range(@intCast(t[4]), @intCast(t[5]))][@intCast(t[6] - 1)] = try fnByName(cb, name);
             }
         }
+        k.fallback();
         return k;
+    }
+
+    /// The (8, 12) range on (2, 16)'s kernels where the kit or cubin has no (8, 12) template (a CUDA cubin, an AMD kit
+    /// before it): the generic kernels take any K2 of 2..16, so such a layer runs as it did before the template.
+    pub fn fallback(k: *Kernels) void {
+        const narrow = range(8, 12);
+        const generic = range(2, 16);
+        if (k.mma[narrow] == null) k.mma[narrow] = k.mma[generic];
+        if (k.rows[narrow] == null) k.rows[narrow] = k.rows[generic];
+        for (&k.cp[narrow], k.cp[generic]) |*n, g| {
+            if (n.* == null) n.* = g;
+        }
     }
 
     pub fn unload(k: *Kernels) void {
@@ -198,14 +217,19 @@ pub const PfPlan = struct {
 };
 
 /// The prompt experts on the AMD kit: null when ex's bits are not the kernels' (gate and up of an expert differing:
-/// weights.Experts.k2_masks) or the shapes are not (a 2D node's halves stay on exl3_experts2d).
+/// weights.Experts.k2_masks) or the shapes are not (a 2D node's halves take exl3_experts2d.pfPlans, two plans).
 pub fn pfPlan(ex: weights.Experts, sc: Scratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) ?PfPlan {
+    if (ex.down_k != ex.width or ex.down_n != ex.dims) return null;
+    return pfPlanOf(ex, sc, x, x_stride, pick, wts, out, r, limit, ex.dims, ex.width);
+}
+
+/// pfPlan at the widths given: d gate / up's K, down's output columns and out's row; i gate / up's output columns and
+/// down's K (the kernels read every per-expert scale row and the trellis strips at these widths). A 2D node launches
+/// its gate / up half and its down half each with its own (exl3_experts2d.pfPlans).
+pub fn pfPlanOf(ex: weights.Experts, sc: Scratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32, d: usize, i: usize) ?PfPlan {
     const masks = ex.k2_masks orelse return null;
-    const d: usize = ex.dims;
-    const i: usize = ex.width;
     const e: usize = ex.count;
     const slots = sc.slots;
-    if (ex.down_k != i or ex.down_n != d) return null;
     if (d % 256 != 0 or i % 128 != 0 or (d / 16) % 4 != 0 or (i / 16) % 4 != 0 or e > 1024 or x_stride % 4 != 0) return null;
     const p = r * slots;
     const nm: usize = if (p >= 48 * e) 128 else 64; // 128 rows a job when the experts average 48 rows or more
@@ -238,15 +262,34 @@ pub fn pfPlan(ex: weights.Experts, sc: Scratch, x: u64, x_stride: usize, pick: u
 
 /// pfPlan's launches on `s` (blocks of 1,024 threads for count, 256 for the others).
 pub fn promptPf(pf: *const Pf, s: gpu.Stream, plan: PfPlan) !void {
+    try pfKernels(pf, plan, true);
+    try pfKernels(pf, plan, false);
+    try pfGateUp(pf, s, plan);
+    try pfDown(pf, s, plan);
+}
+
+fn pfKernels(pf: *const Pf, plan: PfPlan, gu: bool) !void {
+    if (gu) {
+        for (plan.k2_gu[0..plan.n_gu]) |k2| _ = pf.gu[plan.nm][k2] orelse return error.MissingKernel;
+    } else for (plan.k2_d[0..plan.n_d]) |k2| _ = pf.down[plan.nm][k2] orelse return error.MissingKernel;
+}
+
+/// promptPf's first half: count, place and rot (the grouping down reuses), gate / up into xd [R * slots, i] (sorted).
+pub fn pfGateUp(pf: *const Pf, s: gpu.Stream, plan: PfPlan) !void {
     const i: usize = plan.args.i;
-    const d: usize = plan.args.d;
     const mj: usize = plan.args.maxjobs;
-    for (plan.k2_gu[0..plan.n_gu]) |k2| _ = pf.gu[plan.nm][k2] orelse return error.MissingKernel;
-    for (plan.k2_d[0..plan.n_d]) |k2| _ = pf.down[plan.nm][k2] orelse return error.MissingKernel;
+    try pfKernels(pf, plan, true);
     try pfLaunch(pf.count, s, plan.grids[0], 1024, plan.args);
     try pfLaunch(pf.place, s, plan.grids[1], 256, plan.args);
     try pfLaunch(pf.rot, s, plan.grids[2], 256, plan.args);
     for (plan.k2_gu[0..plan.n_gu]) |k2| try pfLaunch(pf.gu[plan.nm][k2].?, s, mj * (i / 128), 256, plan.args);
+}
+
+/// promptPf's second half: down over xd [R * slots, i] into z, then the combine into out [R, d] (row stride ldo).
+pub fn pfDown(pf: *const Pf, s: gpu.Stream, plan: PfPlan) !void {
+    const d: usize = plan.args.d;
+    const mj: usize = plan.args.maxjobs;
+    try pfKernels(pf, plan, false);
     for (plan.k2_d[0..plan.n_d]) |k2| try pfLaunch(pf.down[plan.nm][k2].?, s, mj * (d / 256), 256, plan.args);
     try pfLaunch(pf.combine, s, plan.grids[3], 256, plan.args);
 }
@@ -583,6 +626,10 @@ test "a TP2 DeepSeek-V4.1 rank's prompt experts: settings, lists and ranges" {
     try std.testing.expectEqual(@as(usize, 0), range(8, 8));
     try std.testing.expectEqual(@as(usize, 1), range(3, 10));
     try std.testing.expectEqual(@as(usize, 2), range(4, 12));
+    try std.testing.expectEqual(@as(usize, 3), range(8, 12));
+    try std.testing.expectEqual(@as(usize, 1), range(8, 10));
+    try std.testing.expectEqual(@as(usize, 2), range(8, 16));
+    try std.testing.expectEqual(@as(usize, 2), range(2, 12));
     try std.testing.expectEqual(@as(usize, 5120), Scratch.promptZ(5120, 1152));
 }
 

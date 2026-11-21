@@ -14,6 +14,7 @@ const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
+const queue_cap = @import("queue_cap.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -158,7 +159,15 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
     if (input.prompt != null) thinking = false;
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
-    const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    // the renders (template, tokenizer, the prefix probes below) run in a scratch arena freed when this returns: a
+    // request that then waits for a lane holds its body, its parse and its ids, not every string its renders made.
+    // A request with images keeps them, and its renders, where its body is.
+    var scratch: std.heap.ArenaAllocator = .init(srv.gpa);
+    defer scratch.deinit();
+    const own = input.images.len > 0;
+    var scx: Cx = .{ .a = if (own) a else scratch.allocator() };
+    const drawn = prompt_mod.prepare(srv, &scx, input, thinking, effort) catch |e| return relay(cx, &scx, e);
+    const rendered: prompt_mod.Rendered = .{ .ids = if (own) drawn.ids else try a.dupe(u32, drawn.ids), .history_len = drawn.history_len, .images = drawn.images };
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
@@ -169,14 +178,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, &scx, input.messages, input.tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
     };
     // the client's own shared prefix (`shared_messages`: k): the end of its first k messages, kept as a shared cut
     if (f.get("shared_messages")) |v| if (v.int64()) |k| if (k > 0 and input.prompt == null) {
-        const cut = prompt_mod.messagesPrefixLen(srv, cx, input.messages, @intCast(k), input.tools, rendered.ids, thinking, effort);
+        const cut = prompt_mod.messagesPrefixLen(srv, &scx, input.messages, @intCast(k), input.tools, rendered.ids, thinking, effort);
         if (cut > 0) try shared.append(a, @intCast(cut));
     };
     const sampling = try srv.resolveSampling(cx, f, input.temperature, rendered.ids);
@@ -207,7 +216,18 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
             request.think_end = srv.think_close_end;
         }
     }
+    // rendered and checked: what the request holds now is charged to the queue cap, which may refuse it (429)
+    try queue_cap.charge(cx);
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+}
+
+/// A refusal made in the scratch arena, copied into the request's before that arena goes.
+fn relay(cx: *Cx, scx: *const Cx, e: errors.Refused) errors.Refused {
+    if (e == error.Refused) {
+        cx.kind = scx.kind;
+        cx.message = try cx.a.dupe(u8, scx.message);
+    }
+    return e;
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).

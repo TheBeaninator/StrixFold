@@ -10,6 +10,17 @@
 # The ranks run on cores 5 and 6 and their proxy threads on 7 and 4: two spinning threads on one core wait for the
 # scheduler tick (4 ms at HZ=250) at every handoff.
 set -u
+# World 4 (rdma_proxy at four ranks: rdma_proxy.zig RdmaProxyN, one QP a peer): the same cases at four ranks run GPU-free in the host
+# tests (rdma_proxy4_test.zig, a fake fabric under rdma_core.CoreN and host threads doing coll.stage / coll.collect).
+# WORLD=4 HOSTTEST_LOG=<log of zig_build.sh test-dsv41-hip-host --summary all> reads their verdict lines:
+if [ "${WORLD:-2}" = 4 ]; then
+  log=${HOSTTEST_LOG:?WORLD=4 reads the host-test log named by HOSTTEST_LOG}
+  grep -o '\(PASS\|FAIL\) world 4 fault matrix: [^|]*' "$log"
+  pass=$(grep -c 'PASS world 4 fault matrix' "$log"); fail=$(grep -c 'FAIL world 4 fault matrix' "$log")
+  echo "fault matrix (world 4, fake fabric): $pass passed, $fail failed"
+  [ "$pass" -ge 11 ] && [ "$fail" = 0 ]
+  exit
+fi
 cd "${COLL_DIR:-$(dirname "$0")}"
 BIN=${COLL_CHECK:-./tf-dsv41-coll-check}
 PORT=29800

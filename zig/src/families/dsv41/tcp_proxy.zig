@@ -311,7 +311,7 @@ pub const TcpProxy = struct {
     /// (read after the stream synchronized: the proxy threads' wire counts are then settled)
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
         const t: *TcpProxy = @ptrCast(@alignCast(ptr));
-        return .{ .staged = @atomicLoad(u64, &t.shared.seq, .acquire), .cable1 = t.w.seq, .cable2 = if (t.w2) |w2| w2.seq else 0, .host = t.host.w.seq };
+        return .{ .staged = @atomicLoad(u64, &t.shared.seq, .acquire), .cable1 = t.w.seq, .cable2 = if (t.w2) |w2| w2.seq else 0, .host = t.host.w.seq, .host_bytes = t.host.xchg_bytes, .host_ns = t.host.xchg_ns };
     }
 
     fn check(ptr: *anyopaque) coll.Error!void {

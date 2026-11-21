@@ -47,9 +47,10 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("WORLD is 1, 2 or 4, RANK below it; --parity needs WORLD 4\n{s}", .{usage});
         return 2;
     }
+    // the balanced experts split (TF_DS_2D_GU=parity) is not in plan.wants: only the first-blocks split is built
+    if (parity) { std.debug.print("--parity: plan.wants builds TF_DS_2D_GU=first only\n", .{}); return 2; }
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
-    if (world == 4 or parity) { std.debug.print("this engine branch splits over one or two ranks only\n", .{}); return 2; }
-    const split: dsv41.plan.Split = .{ .rank = rank, .world = world };
+    const split = try dsv41.plan.Split.node(rank, world);
     const cfg = try dsv41.Config.read(a, io, args[1]);
     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
     defer sh.close(io);

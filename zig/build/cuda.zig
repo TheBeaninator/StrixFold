@@ -235,7 +235,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, eng.api, eng.engines, eng.dsv41, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     // every dsv41 tool compiled (not run) against the kernel-less runtime, so a family change that breaks a CUDA-only
     // tool fails here too (the AMD hosts have no nvcc to build them for real)
-    for ([_][]const u8{ "check_main", "rank_cache_main", "load_main", "comm_main", "layer_main", "rdma_bench_main", "engram_check_main", "picture_main", "vit_main", "ring2d_check_main", "lanes_main" }) |name| {
+    for ([_][]const u8{ "check_main", "rank_cache_main", "rank_reslice_main", "load_main", "comm_main", "layer_main", "rdma_bench_main", "engram_check_main", "picture_main", "vit_main", "ring2d_check_main", "lanes_main" }) |name| {
         const m = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/src/families/dsv41/{s}.zig", .{name})), .target = host, .optimize = .debug, .link_libc = true });
         m.addImport("dsv41", eng.dsv41);
         m.addImport("cuda", cuda);

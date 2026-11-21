@@ -20,6 +20,8 @@ what the engine's own wrapper asks for (grid, constexprs, scalars, pointer types
   The rules mirror those Zig functions; change them together.
 - The indexer's launches at every context the engine serves (context_cases), and the prompt launches whose POS the
   replay cut offsets by an odd row (offset_cases).
+- A four-node 2D node's own shapes (tp4_cases): the attention core at 16 heads, the drafter's Markov finish over its
+  head quarter's segments and its pick over four nodes. --tp4-only adds just these to an existing derived file.
 
 Only launches no recorded variant already compiles are written (aot_build.plan_variant's key).
 
@@ -410,6 +412,120 @@ def markov_cases(rec):
     return out
 
 
+# ---- the four-node 2D split (TP4): a node's own shapes ------------------------------------------------------------
+# A 2D node (plan.Split pair p, TP2 rank r) keeps its pair's half of its TP2 rank's heads (plan.headSpan: 16 of 32) and
+# runs the TP2 engine's kernels on them; the exchanges give it TP2's bytes back for everything else (prompt2d.zig), so
+# only the attention core's head count and the drafter's Markov loop (draft2d.markov: the head quarter in 128-column
+# segments, the bests gathered over four nodes) launch other shapes than TP2:
+#   _sparse_attn_part, _sparse_attn_merge, _sparse_attn_merge_rot2 (tri_attn.sparseAttn) and _rope_heads (tri_norm
+#     ropeHeads: the heads' q and the inverse on o; the indexer's 32 heads of 128 are replicated) at H = 16, the
+#     backbone's only (the DSpark drafter's blocks run TP2 inside the pair: 32 heads, TP2's launches);
+#   _finish at BP = pow2(n_part), n_part the quarter's 253 or 252 segments (pair 0, pair 1); _pick at WORLD 4.
+# _bias and _score take the same variants at the quarter's widths (their ints are do_not_specialize). On HIP,
+# aux.sparse_attn is compiled for 32 heads (tri_aux.attn_heads), so every 16-head attention launch is a Triton one.
+TP4_HEADS = 16
+TP4_HALF_BLOCKS = (253, 252)  # a TP2 vocabulary half's 505 blocks of 128: pair 0's part, pair 1's (plan.cut)
+TP4_ATTN = ("_sparse_attn_part", "_sparse_attn_merge", "_sparse_attn_merge_rot2")
+
+
+def _contig(shape):
+    st, acc = [], 1
+    for d in reversed(shape):
+        st.append(acc)
+        acc *= d
+    return list(reversed(st))
+
+
+def _reshape(c, name, shape):
+    t = c["tensors"][name]
+    if t[2] == _contig(t[1]):
+        t[2] = _contig(shape)
+    t[1] = list(shape)
+
+
+def _halve(c, name):
+    """A tensor of the heads' partials ([rows x heads x ...] flat): half the elements."""
+    t = c["tensors"][name]
+    _reshape(c, name, [t[1][0] // 2] + t[1][1:])
+
+
+def tp4_cases(cases):
+    """Each TP2 launch whose shape a 2D node changes, at the node's shape (cases: fn -> recorded and derived)."""
+    out = {}
+    for fn in TP4_ATTN + ("_rope_heads",):
+        for t in cases.get(fn, []):
+            k = t["consts"]
+            if k.get("H") != 32 or k.get("HD") != 512 or t["phase"].startswith("draft"):
+                continue  # the indexer's heads (HD 128), the 1-head launches and the drafter's blocks stay TP2's
+            c = copy.deepcopy(t)
+            h = TP4_HEADS
+            c["consts"]["H"] = h
+            hb = k["HB"]
+            if fn == "_rope_heads":
+                c["consts"]["HB"] = min(h, 16)
+                c["grid"] = [t["grid"][0], h // c["consts"]["HB"], 1]
+                _reshape(c, "X", [t["tensors"]["X"][1][0], h, 512])
+            else:
+                out_t = "Q" if fn == "_sparse_attn_part" else "OUT"
+                rows = t["tensors"][out_t][1][0]
+                if fn == "_sparse_attn_part":
+                    _reshape(c, "Q", [rows, h, 512])
+                    _reshape(c, "OUT", [rows, h, 512])
+                    c["grid"] = [t["grid"][0], h // hb, t["grid"][2]]
+                else:
+                    _reshape(c, "OUT", [rows, h, 512])
+                    c["grid"] = [t["grid"][0], h if fn == "_sparse_attn_merge_rot2" else h // hb, 1]
+                _reshape(c, "SINK", [h])
+                if not k.get("FINAL", 0):
+                    for name in ("PM", "PL", "PO"):
+                        if name in c["tensors"]:
+                            _halve(c, name)
+                if fn == "_sparse_attn_merge_rot2":
+                    _reshape(c, "SUH", [t["tensors"]["SUH"][1][0] // 2])
+                    _reshape(c, "XH", [rows, t["tensors"]["XH"][1][1] // 2])
+            c["phase"] = f"tp4:{t['phase']}"
+            c["derived"] = {"rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"}
+            out.setdefault(fn, []).append(c)
+    for t in cases.get("_finish", []):
+        for p, segs in enumerate(TP4_HALF_BLOCKS):
+            c = copy.deepcopy(t)
+            n = t["tensors"]["PV"][1][0]
+            c["consts"]["BP"] = 1 << (segs - 1).bit_length()
+            c["scalars"]["n_part"] = segs
+            _reshape(c, "PV", [n, segs])
+            _reshape(c, "PI", [n, segs])
+            c["tp4"] = {"r": 0, "p": p}
+            c["phase"] = f"tp4:{t['phase']}"
+            c["derived"] = {"rule": f"tp4: draft2d.markov's head quarter, pair {p}: {segs} segments of 128 (n_part)"}
+            out.setdefault("_finish", []).append(c)
+    for t in cases.get("_pick", []):
+        c = copy.deepcopy(t)
+        c["consts"]["WORLD"] = 4
+        g = t["tensors"]["G"][1]
+        _reshape(c, "G", [4] + g[1:])
+        c["tp4"] = {"r": 0, "p": 0}
+        c["phase"] = f"tp4:{t['phase']}"
+        c["derived"] = {"rule": "tp4: draft2d's Markov pick over the four nodes' bests (WORLD 4)"}
+        out.setdefault("_pick", []).append(c)
+    return out
+
+
+def tp4_merge(rec, derived, src):
+    """derived plus the TP4 launches no recorded or derived variant compiles (earlier TP4 cases replaced)."""
+    derived = {fn: [c for c in cs if not c.get("derived", {}).get("rule", "").startswith("tp4:")] for fn, cs in derived.items()}
+    seen = {variant_key(fn, c) for fn in rec for c in rec[fn]} | {variant_key(fn, c) for fn in derived for c in derived[fn]}
+    both = {fn: rec.get(fn, []) + derived.get(fn, []) for fn in set(rec) | set(derived)}
+    for fn, cases in sorted(tp4_cases(both).items()):
+        for c in cases:
+            key = variant_key(fn, c)
+            if key in seen:
+                continue
+            seen.add(key)
+            c["derived"].update(src)
+            derived.setdefault(fn, []).append(c)
+    return {fn: cs for fn, cs in derived.items() if cs}
+
+
 def variant_key(fn, case):
     """aot_build's distinct-variant key of a launch (constexprs, runtime parameters' types and specialization)."""
     import aot_build
@@ -424,9 +540,21 @@ def main():
     ap.add_argument("--config", default=str(BUNDLE / "model" / "config.json"))
     ap.add_argument("--out", default=str(DERIVED))
     ap.add_argument("--pool-max", type=int, default=1048527, help="the longest pool served (the RoPE tables' rows)")
+    ap.add_argument("--tp4-only", action="store_true",
+                    help="keep --out's derived launches and (re)add only the 2D split's (no inventory or config read)")
     a = ap.parse_args()
     sys.path.insert(0, str(HERE))
     rec = json.loads(RECORDED.read_text())
+    if a.tp4_only:
+        derived = tp4_merge(rec, json.loads(Path(a.out).read_text()), {"recorded_sha256": hashlib.sha256(RECORDED.read_bytes()).hexdigest()})
+        Path(a.out).write_text(json.dumps(derived, indent=1, sort_keys=True) + "\n")
+        for fn, cases in sorted(derived.items()):
+            tp4 = [c for c in cases if c["derived"]["rule"].startswith("tp4:")]
+            if tp4:
+                print(f"{fn}: {len(tp4)} TP4 variants")
+                for c in tp4:
+                    print(f"  {c['phase']} grid={c['grid']} " + " ".join(f"{x}={c['consts'][x]}" for x in ("H", "SPLITS", "NBLK", "FINAL", "BP", "WORLD", "INV") if x in c["consts"]))
+        return
     inv_p, cfg_p = Path(a.inventory), Path(a.config)
     src = {"inventory_sha256": hashlib.sha256(inv_p.read_bytes()).hexdigest(),
            "config_sha256": hashlib.sha256(cfg_p.read_bytes()).hexdigest()}
@@ -449,6 +577,7 @@ def main():
             seen.add(key)
             c["derived"].update(src)
             derived.setdefault(fn, []).append(c)
+    derived = tp4_merge(rec, derived, src)
     Path(a.out).write_text(json.dumps(derived, indent=1, sort_keys=True) + "\n")
     for fn, cases in sorted(derived.items()):
         print(f"{fn}: {len(cases)} new variants")

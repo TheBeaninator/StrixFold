@@ -90,6 +90,60 @@ small local vision model that describes them and answers follow-up questions:
 What made the link between the boxes fast and steady (MTU, which traffic goes on which cable, TCP retransmit floors,
 power settings) is in [docs/TUNING.md](docs/TUNING.md). Most of it applies to any two-box Strix Halo setup.
 
+## Four boxes (TP4), on this branch
+
+This branch adds a four-box split: DeepSeek-V4.1-Flash at 4.0 bpw, tensor-parallel over four Strix Halo boxes (the
+exact 2D split `prompt2d.zig` describes, world 4). It is the fork's working build, offered upstream in
+[issue #57](https://github.com/Shoestring-dev/StrixFold/issues/57); it is not part of upstream.
+
+Measured with upstream's serving bench `v41bench_tf.py` (see tools/dsv41-hip/RESULTS.md; prompt set v1, `--levels 1,2,3,4,5,6,7,8 --prefill ''`, temperature 0, thinking off,
+replies capped at 200 tokens and 150 for summary), total tok/s, the mean of the 8 category medians over 3 passes:
+
+| Chats at once | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| TP4, 4.0 bpw, rdma_proxy, drafts on | 63.58 | 88.75 | 102.18 | 109.46 | 113.88 | 117.29 | 117.31 | 122.63 |
+| Pair, 2.9 bpw (for comparison) | 48.55 | 63.96 | 73.73 | 77.06 | 80.40 | 83.23 | 88.08 | 91.80 |
+
+One chat with a cold prompt read 1,330 to 1,490 tok/s from 8K to 128K tokens of context and wrote 77 to 85 tok/s with
+drafts on (36 to 37 with drafts off). The boxes: four Ryzen AI Max+ 395 with 128 GB each, one ConnectX-6 Dx port each
+on one 100 GbE switch (RoCE v2).
+
+What the branch carries on top of upstream `93d28458`:
+
+- The 2D split built into `native-hip`, sparse attention at 16 heads a rank, and a node's prompt experts on TP2's
+  kernel path (TP4 and the pair gave the same prompt-logits sha256 on 8 frozen prompts at 2.9 bpw).
+- TP4 rank files: `tf-dsv41-rank-reslice` and `tools/dsv41-hip/reslice_tp4.sh` cut them from the TP2 rank files.
+- Four-rank collectives: RCCL through `Comm.coll`, and `rdma_proxy` at four ranks (one QP a peer), with prompt
+  gathers pipelined over lanes (`TF_COLL_LANES`), `catRank` as a pair exchange, one-row quarters gathered straight
+  into place (`COLL_SWAP12`) and multi-row quarters assembled with two copies (`VGATHER`).
+- Faster attention linears on a 2D node (`TP4_FILL`) and the prompt split overlapped at world 4 (`PREFILL_SPLIT`
+  with `PREFILL_ZIP2`).
+- `first_light.sh` and `serve_lib.sh` start, check and stop four boxes (`tp4.conf`); `tfp-node0` is the word-checked
+  remote end for the other boxes, usable as an ssh forced command; `tp4_orch_test.sh` checks the orchestration on
+  stubs.
+- Server and engine changes that also apply to a pair, several of them open upstream pull requests: the request
+  queue cap (429), an idle connection's buffers given back, the collective timer (`TF_DS_COLL_TIME`), control-link
+  keepalives, `_exit` after teardown on HIP, the `/cache` transfer routes (off by default), the picture cache
+  (`ENCODE_CACHE_MIB`), the disk tier at world 4, a 256 MiB request body limit, and Pillow from the deploy
+  (`TF_PIL_PATH`) so JPEG and other non-PNG pictures decode on boxes without Pillow.
+
+To run it:
+
+1. Build `native-hip` with a Triton kit that has the 16-head variants (`tools/dsv41-hip/tri/README.md`,
+   `t_hipattn16.py`) and deploy the same build to all four boxes (`tools/dsv41-hip/BUILD_AND_RUN.md`). RCCL needs a
+   gfx1151 `librccl` built against the engine's TheRock (`RCCL_LIB`).
+2. Cut the four rank files from your TP2 bundle: `tools/dsv41-hip/reslice_tp4.sh TP2_BUNDLE OUT_BUNDLE 0 1 2 3`, and
+   put rank g's file on box g. Each box also needs the Engram shards.
+3. Copy `tools/dsv41-hip/tp4.conf` and fill in the lines marked SET (addresses, deploy, bundle). As shipped it is the
+   first-light setup (RCCL, one stream, drafts off). The numbers above used these keys on top of it:
+   `TRANSPORT=rdma`, `RDMA_DEV0`..`RDMA_DEV3` (each box's RoCE device), `COLL_SLOT_KIB=8704`,
+   `COLL_PROXY_STRIPE_KIB=0`, `COLL_SWAP12=1`, `VGATHER=1`, `TP4_FILL=1`, `DRAFTS=1`, `GRAPHS=1`,
+   `STREAMS=16`, `PARALLEL=16`, `CONTEXT=524288`, `POOL=22000000`, `MAX_TOKENS=524288`, `PREFILL_SPLIT=256`,
+   `PREFILL_ZIP2=1`, `PROMPT_CACHE_GIB=4`, `LOGITS_SHA=0`, `AUX=`, `PEAK_GIB=88`.
+4. On rank 1's box: `TF_SERVE_CONF=$HOME/tfp/run/conf/tp4.conf tools/dsv41-hip/first_light.sh plan` prints every
+   rank's launch line; `... first_light.sh up` starts the four ranks (followers first, all GPU locks or none) and
+   `... down` stops them.
+
 ## Known limits
 
 - Tested on this exact setup only. Other Strix Halo machines, ROCm versions and cables may behave differently.

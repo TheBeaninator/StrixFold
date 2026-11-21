@@ -33,6 +33,7 @@ test {
     _ = @import("listener.zig");
     _ = @import("hub.zig");
     _ = @import("chunk_plan.zig");
+    _ = @import("prompt.zig");
     _ = @import("status_routes.zig");
     _ = @import("log.zig");
     _ = @import("messages.zig");
@@ -42,9 +43,14 @@ test {
     _ = @import("image_limits_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("shared_messages_test.zig");
+    _ = @import("cache_key.zig");
+    _ = @import("cache_routes_test.zig");
+    _ = @import("http_body_test.zig");
     _ = @import("effort_values_test.zig");
     _ = @import("telemetry_reply_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
+    _ = @import("queue_cap.zig");
+    _ = @import("queue_cap_test.zig");
 }

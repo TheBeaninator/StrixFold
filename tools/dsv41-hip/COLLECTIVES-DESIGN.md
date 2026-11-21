@@ -202,6 +202,14 @@ Validated already in Phase 0 (gpuvis, ds4-style kernels): 0 element errors over 
   on one cable; 40 MiB 10.8 vs 16.6 ms; 10 MiB 2.5 vs 3.7 ms. Whole 2048-row chunks did not gain as much (744 vs 835 ms
   median) because frame loss at these sizes caused retransmission stalls (section 4). At MTU 1500 the loss is gone and
   a striped chunk takes 512 ms (one cable 807 ms); through tcp_host 641 ms striped.
+- A thread a link (`TF_COLL_WIRE_THREADS=2`, serve.conf `COLL_WIRE_THREADS`; default 1; this rank's own, not in the
+  handshake): a helper thread per tcp_host wire moves the second link's half of every striped payload while the calling
+  thread moves the first, so each link's copies and its socket's receive work have a core. The bytes on each link, the
+  headers and the order are unchanged, and a rank on two threads pairs with a rank on one. On one network card the
+  second link is a second connection to the same address (`TF_TP_STRIPE` = rank 0's own). The helper starts with the
+  first striped payload, spins 20 ms for its next part and then sleeps. Loopback TCP on one Strix Halo box, 4 MiB
+  chunks (`TF_WIRE_BENCH=1` in the host suite prints it): 12.4 to 12.7 GB/s each way on one link, 14.0 to 15.0 on two
+  links with one thread, 24.2 to 24.4 with a thread a link. Not measured on a pair.
 
 ### 3.3 The coherent slab (tcp_proxy)
 `hipHostMalloc(Mapped|Coherent)`; RLIMIT_MEMLOCK (8 MiB) does not constrain it (256 MiB measured). Slot size = largest
@@ -250,7 +258,9 @@ side runs a prefill chunk as two halves zipped layer by layer (section 5.3).
 immediate per staged slot. Everything else is tcp_proxy's: the hipHostMalloc(Mapped|Coherent) slab and its
 `tf_ds_coll_shared` header, the `coll.stage` / `coll.collect` kernels, the ready / done / consumed generation protocol,
 the abort word and the fault contract (section 2.3 to 2.5); graph capture is unchanged because the proxy never sees a
-host call. Gathers larger than a slot keep tcp_host (prefill stays on TCP).
+host call. Gathers larger than a slot keep tcp_host (prefill stays on TCP), and tcp_host reads its own settings under
+kind rdma as under proxy: a second data link (`TF_TP_STRIPE`, `TF_COLL_STRIPE_MIB`) and a thread a link
+(`TF_COLL_WIRE_THREADS`). Only the slot gathers' stripe thread (`TF_COLL_PROXY_STRIPE_KIB`) is refused.
 
 Per gather q in slot s = q mod NSLOT, the proxy thread (pinned to `TF_COLL_PROXY_CPU`, busy-polling, never a completion
 channel) sees ready[s] == q; writes a 64-byte trailer (magic, session epoch, q, bytes, site, rank) into TX[s] at
@@ -290,6 +300,30 @@ enough: `limits.d` and `LimitMEMLOCK=` in any unit); an ssh `ControlMaster` sess
 keeps the old limit; the HIP build has no `fabric` module, so `rdma_proxy` takes libibverbs through the small
 `verbs` module (dlopen, no link dependency). The host suite's loopback tests need `TF_RDMA_TEST_DEVICE=<ibdev>`: both
 ranks' QPs on one HCA, skipped without it.
+
+### 3.7 RCCL at four ranks (rail; TP4)
+
+tcp_coll, tcp_proxy and rdma_proxy are two-rank transports. At world 4 a HIP rank runs comm.zig's `Comm`, the CUDA NCCL
+path, over RCCL: `gpu.nccl` on HIP is `zig/src/gpu/hip/rccl.zig`, the same entry points, unique id and type numbering
+as `zig/src/cuda/nccl.zig` over the HIP ABI. `TF_DS_COLL` picks the transport (`comm.chosen`): `rccl` (the default at
+world 4) or `tcp` (the default at world 2; refused at world 4). Rank 0 makes the unique id and sends it over each Fan
+link; `Comm.coll` serves `all_gather` (ncclAllGather of bytes) and `exchange` (ncclSend + ncclRecv in one group).
+
+- Library: `TF_RCCL_LIB`, else `librccl.so.1` on the loader path. The build is RCCL 2.28.3 for gfx1151 against TheRock
+  10.2 (its RUNPATH is TheRock 10.2's lib), so it shares the engine's libamdhip64.
+  `Library.openPath` refuses a process that maps two different libamdhip64 files (`error.TwoHipRuntimes`).
+- Graphs: `Comm.coll` reports `capturable`; RCCL's kernels under hipStreamBeginCapture are what TF_DS_GRAPHS=1 relies
+  on, and only a hardware run shows it.
+- Contract differences from the TCP transports: RCCL carries no header, so a site, layer or byte mismatch between ranks
+  is not detected (a hang or wrong bytes, not `Mismatch`); abort poisons the Coll but does not interrupt a kernel
+  already enqueued; there is no progress deadline of ours (NCCL_TIMEOUT-style watchdogs are RCCL's own).
+- Rail environment (the usual RCCL-over-RoCE recipe): `NCCL_SOCKET_IFNAME` = the rail interface, `NCCL_IB_HCA` = its rocep device,
+  `NCCL_IB_GID_INDEX=3`, GPU-direct via `NCCL_NET_GDR_LEVEL=SYS NCCL_NET_GDR_READ=1 NCCL_DMABUF_ENABLE=1`,
+  `LimitMEMLOCK=infinity`, no `HSA_OVERRIDE_GFX_VERSION` (the library carries gfx1151 code), never LD_PRELOAD a second
+  HIP runtime.
+- Tests: `zig build test-dsv41-hip-coll` (no GPU work) opens the real librccl through the facade, then runs four ranks
+  on threads over loopback Fans against a host fake of the RCCL calls: all-gathers in rank order (1 B to 1 MiB, f32
+  counts), exchanges with every peer at direction-dependent sizes, poisoning after a failed call, abort.
 
 ## 4. Link reliability (USB4 frame loss and TCP retransmission timeouts)
 Measured 2026-10-19 under the GPU/link lock and the quiet lock on both boxes (sessions logged in tf-port/w-link/

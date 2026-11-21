@@ -36,8 +36,11 @@ pub fn main(init: std.process.Init) !u8 {
     var ix = try dsv41.rank_cache.open(init.gpa, io, dir, name);
     defer ix.deinit();
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the cache file is still rank g of 4
-    if (world == 4 or parity) { std.debug.print("this engine branch splits over one or two ranks only\n", .{}); return 2; }
-    const split: dsv41.plan.Split = .{ .rank = rank, .world = world };
+    if (parity) { std.debug.print("--parity: plan.wants builds TF_DS_2D_GU=first only\n", .{}); return 2; }
+    const split = dsv41.plan.Split.node(rank, world) catch {
+        std.debug.print("WORLD is 1, 2 or 4, RANK below it\n{s}", .{usage});
+        return 2;
+    };
     var sh = try dsv41.checkpoint.Shards.open(init.gpa, io, args[1]);
     defer sh.close(io);
     const want = try dsv41.plan.wants(a, cfg, split, dspark, try dsv41.checkpoint.denseOf(&sh, cfg, dspark));

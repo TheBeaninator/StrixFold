@@ -1,9 +1,10 @@
 #!/bin/bash
-# prepare_inputs.sh MODEL_DIR ENGRAM_DIR OUT_DIR [ROWS]: the CPU-only TP2 inputs bundle (BUILD_AND_RUN.md section 3), no CUDA, no
+# [WORLD=4] prepare_inputs.sh MODEL_DIR ENGRAM_DIR OUT_DIR [ROWS]: the CPU-only TP2 (WORLD=4: TP4 2D split) inputs bundle (BUILD_AND_RUN.md section 3), no CUDA, no
 # NVIDIA container, no GPU:
 #   model/{config.json,tokenizer.json,chat_template.jinja (c282975e…)}, dsv41_token_map.json, kit/engram.json,
 #   kit/rope-*.f32 + rope.json (ROWS rows, default 65536; the engine reads pool + 49 rows, so ROWS covers any
-#   --context up to ROWS - 49), rank{0,1}/rank-cache/rank{R}of2-<index hash>.bin, inputs_manifest.json.
+#   --context up to ROWS - 49), rank{0,1}/rank-cache/rank{R}of2-<index hash>.bin (WORLD=4: rank{0..3}/rank-cache/
+#   rank{G}of4-<index hash>.bin), inputs_manifest.json.
 # Every checkpoint and Engram file is authenticated against the pinned HF metadata first; each rank cache is written
 # by tf-dsv41-rank-cache and byte-checked in full (tf-dsv41-check --bytes 1) against the Python rank plan's exact
 # entry count and data bytes; the RoPE tables must hash to a reference derived from the creator kit's served tables
@@ -30,7 +31,7 @@ if [ -z "${TFP_SCOPED:-}" ]; then
   exec systemd-run --user --scope --quiet -p CPUQuota=800% -p MemoryHigh=4G -p MemoryMax=8G -- \
     taskset -c 8-15,24-31 /usr/bin/nice -n 19 /usr/bin/ionice -c3 "$0" "$@"
 fi
-MODEL=$1 ENGRAM=$2 OUT=$3 ROWS=${4:-65536}
+MODEL=$1 ENGRAM=$2 OUT=$3 ROWS=${4:-65536} WORLD=${WORLD:-2}
 . "$HERE/kit_pin.sh"
 TOOLS=$(input_tools "$HERE")
 PY=${TFP_INPUT_PYTHON:-$HOME/venvs/tfp-inputs/bin/python}
@@ -50,5 +51,5 @@ REF=$OUT.rope-reference.json  # kept beside the bundle: the bundle itself is exa
 "$PY" "$HERE/rope_reference.py" "$TOOLS" "$MODEL/config.json" "$ROWS" "$REF"
 echo "$(date '+%F %T') prepare_inputs.py full mode: $MODEL -> $OUT ($ROWS RoPE rows)"
 "$PY" "$TOOLS/prepare_inputs.py" "$MODEL" "$OUT" --rows "$ROWS" --engram-dir "$ENGRAM" \
-  --rank-cache-bin "$BIN/tf-dsv41-rank-cache" --check-bin "$BIN/tf-dsv41-check" --rope-reference "$REF"
+  --rank-cache-bin "$BIN/tf-dsv41-rank-cache" --check-bin "$BIN/tf-dsv41-check" --rope-reference "$REF" --world "$WORLD"
 echo "$(date '+%F %T') done: $OUT/inputs_manifest.json"

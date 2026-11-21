@@ -52,13 +52,27 @@ pub fn hcPf2Ok(d: usize) bool {
 pub const Posted = struct { gathered: u64, world: usize, h_out: u64 };
 
 /// hc_pre2's `sink` (only if hcDeferOn(d)): a side stream and the event forking it; the caller joins it (rounds.py).
-/// cnt: _hc_fused's arrival counters (int32, at least cdiv(rows, hcRb(rows)), zero; each launch leaves them zero), or 0.
+/// cnt: _hc_fused's and _hc_chain's arrival counters (int32, at least cdiv(rows, hcRb(rows)), zero; each launch leaves
+/// them zero), or 0.
 pub const Sink = struct { s: gpu.Stream, fork: gpu.Event, cnt: u64 = 0 };
 
 /// TF_HC_FUSE=1 (read by Round.init, every rank alike; default off): on hc_dots' path the finish's collapse + RMSNorm, the
 /// mixes of the stored streams and the Sinkhorn as one launch, _hc_fused (tools/dsv41-hip/exl3/kdec/hc_fuse.py: their
 /// own code, the same bits), on this stream; nothing goes to the side stream.
 pub var fuse = false;
+
+/// TF_HC_CHAIN=1 (read by Round.init, every rank alike; default off): on hc_dots' path the WHOLE chain, the post alone
+/// included, as one launch, _hc_chain (tools/dsv41-hip/exl3/kdec/hc/hc_chain.py: the mixes in the posted code, the
+/// finish of the streams they recompute, the Sinkhorn by the last of the group's 3 * NB mixes and of its finish, the
+/// same bits) on this stream; nothing goes to the side stream, for windows of up to chain_rows rows. Needs the arrival
+/// counters, else the launches are the four recorded (as TF_HC_FUSE without them).
+pub var chain = false;
+
+/// The most rows hcPre2 takes as the one launch: a group's last program runs the Sinkhorn of its rows one after
+/// another, so at many rows the four launches are faster. On one box, host-launched, us a site fused against the
+/// four: 1 row 21.37 / 61.59, 6 rows 29.09 / 62.26, 16 rows 115.05 / 60.82; 7-15 rows not timed.
+/// A larger window runs the four recorded launches.
+pub var chain_rows: usize = 6;
 
 /// sink.wait_stream(current stream): a Tri on the side stream after the work queued so far; no PDL (no _pdl() there).
 fn sinkTri(t: Tri, sk: Sink) !Tri {
@@ -72,9 +86,9 @@ fn sinkTri(t: Tri, sk: Sink) !Tri {
     return st;
 }
 
-/// t.run with `rows` appended as an i32 argument.
+/// t.run with `rows` appended as an i32 argument. 20: _hc_chain's 17 + rows is the widest (14 + rows for _hc_fused).
 fn runRows(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, rows: usize) !void {
-    var a: [16]aot.Arg = undefined;
+    var a: [20]aot.Arg = undefined;
     @memcpy(a[0..args.len], args);
     a[args.len] = aot.int("rows", @intCast(rows));
     return t.run(name, grid, a[0 .. args.len + 1], consts);
@@ -135,12 +149,31 @@ fn fused(t: Tri, x: u64, fn_w: u64, part: u64, cnt: u64, base: u64, scale: u64, 
     }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("MB", 8), ci("RB", rb), ci("ITERS", iters), ci("BLOCK", 1024), ci("SST", 1) }, rows);
 }
 
+/// _hc_chain: _hc_post_only, _hc_finish_s's role 1, _hc_mix_part and _hc_sinkhorn as one launch (tri_hc.chain): the
+/// programs (g, b < NB, mg) the posted mixes (writing h_out as the post alone would), (g, NB, 0) the finish of the
+/// streams recomputed inline, and the Sinkhorn by the last of a group's 3 * NB mixes and of its finish (counter
+/// cnt[g]: the finish reads the post / comb that the Sinkhorn overwrites), for rows in groups of hcRb(rows).
+fn chainLaunch(t: Tri, h: u64, ps: Posted, fn_w: u64, part: u64, cnt: u64, base: u64, scale: u64, pre_in: u64, norm_w: u64, out: u64, pre_out: u64, post: u64, comb: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize) !void {
+    const rb = hcRb(rows);
+    try runRows(t, "_hc_chain", .{ tri.cdiv(rows, rb), hc_blocks + 1, 3 }, &.{
+        p("X", "*bf16", h),          p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered),   aot.int("RS", @intCast(rows * d)),
+        p("POST", "*fp32", post),    p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),         p("PART", "*fp32", part),
+        p("CNT", "*i32", cnt),       p("BASE", "*fp32", base),   p("SCALE", "*fp32", scale),     p("PRE_IN", "*fp32", pre_in),
+        p("NW", "*bf16", norm_w),    p("OUT", "*bf16", out),     p("PRE_OUT", "*fp32", pre_out), aot.float("eps", eps),
+        aot.float("hc_eps", hc_eps),
+    }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("MB", 8), ci("RB", rb), ci("ITERS", iters), ci("BLOCK", 1024), ci("WORLD", ps.world) }, rows);
+}
+
 /// hc_pre2: hc_pre's outputs for a decode window (the same bits), the last post fused in if `posted`; returns the src.
 pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, sink: ?Sink, rows: usize, d: usize) !u64 {
     if (posted) |ps| std.debug.assert(ps.h_out != h);
     if (sink != null and posted != null and hcDotsOn(d)) {
         // hc_dots: the post alone and the finish here, the mixes of the stored streams and the Sinkhorn on the side one
         const ps = posted.?;
+        if (chain and sink.?.cnt != 0 and rows <= chain_rows) {
+            try chainLaunch(t, h, ps, fn_w, part, sink.?.cnt, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, rows, d);
+            return ps.h_out;
+        }
         try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
             p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),
@@ -365,13 +398,45 @@ test "TF_HC_FUSE: hc_dots' finish, mixes and Sinkhorn as one launch on this stre
     try std.testing.expectEqual(tri.cdiv(3, 3), log.items.items[1].grid[0]);
     try std.testing.expectEqual(@as(u32, hc_blocks + 1), log.items.items[1].grid[1]);
     try expectLog(&log, &.{ "_hc_post_only", "_hc_fused" }, &.{
-        .{ 0, "XO", ps.h_out }, .{ 1, "X", ps.h_out }, .{ 1, "FN", stand(5) }, .{ 1, "PART", part }, .{ 1, "CNT", stand(14) },
-        .{ 1, "SCALE", stand(6) }, .{ 1, "BASE", stand(7) }, .{ 1, "PRE_IN", stand(8) }, .{ 1, "NW", stand(9) }, .{ 1, "OUT", stand(10) },
+        .{ 0, "XO", ps.h_out },       .{ 1, "X", ps.h_out },     .{ 1, "FN", stand(5) },     .{ 1, "PART", part },   .{ 1, "CNT", stand(14) },
+        .{ 1, "SCALE", stand(6) },    .{ 1, "BASE", stand(7) },  .{ 1, "PRE_IN", stand(8) }, .{ 1, "NW", stand(9) }, .{ 1, "OUT", stand(10) },
         .{ 1, "PRE_OUT", stand(11) }, .{ 1, "POST", stand(12) }, .{ 1, "COMB", stand(13) },
     });
     // no counters (the drafter's rounds, a test's side): the three launches as before, though the switch is on
     _ = try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, side, 3, 5120);
     try expectLog(&log, &.{ "_hc_post_only", "_hc_finish_s", "_hc_mix_part", "_hc_sinkhorn" }, &.{});
+}
+
+test "TF_HC_CHAIN: hc_dots' whole chain, the post included, as one launch wired as the four were" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    const h = stand(1);
+    const part = stand(2);
+    const ps: Posted = .{ .gathered = stand(3), .world = 2, .h_out = stand(4) };
+    var sk = side;
+    sk.cnt = stand(14);
+    chain = true;
+    defer chain = false;
+    try std.testing.expectEqual(ps.h_out, try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, sk, 3, 5120));
+    try std.testing.expectEqual(tri.cdiv(3, 3), log.items.items[0].grid[0]);
+    try std.testing.expectEqual(@as(u32, hc_blocks + 1), log.items.items[0].grid[1]);
+    try expectLog(&log, &.{"_hc_chain"}, &.{
+        .{ 0, "X", h },             .{ 0, "XO", ps.h_out }, .{ 0, "G", ps.gathered }, .{ 0, "POST", stand(12) },    .{ 0, "COMB", stand(13) },
+        .{ 0, "FN", stand(5) },     .{ 0, "PART", part },   .{ 0, "CNT", stand(14) }, .{ 0, "SCALE", stand(6) },    .{ 0, "BASE", stand(7) },
+        .{ 0, "PRE_IN", stand(8) }, .{ 0, "NW", stand(9) }, .{ 0, "OUT", stand(10) }, .{ 0, "PRE_OUT", stand(11) },
+    });
+    // no counters: the four launches as before, though the switch is on
+    _ = try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, side, 3, 5120);
+    try expectLog(&log, &.{ "_hc_post_only", "_hc_finish_s", "_hc_mix_part", "_hc_sinkhorn" }, &.{});
+    // the cap as shipped is 6 rows: a 6-row window is the one launch, a 7-row and a 16-row window the four, counters or not
+    try std.testing.expectEqual(@as(usize, 6), chain_rows);
+    _ = try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, sk, 6, 5120);
+    try expectLog(&log, &.{"_hc_chain"}, &.{});
+    for ([_]usize{ 7, 16 }) |rows| {
+        _ = try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, sk, rows, 5120);
+        try expectLog(&log, &.{ "_hc_post_only", "_hc_finish_s", "_hc_mix_part", "_hc_sinkhorn" }, &.{});
+    }
 }
 
 test "aux.hc_mix_pf takes hc_mix_pf at every row count; Triton keeps another width or world" {

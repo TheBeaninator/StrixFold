@@ -190,6 +190,7 @@ pub const Round = struct {
     ga: u64, // fp32 [world, R, D]
     // MoE
     gl: u64, // fp32 [R, D / 256, experts]: the gate's chunk sums
+    f2_cnt: u64, // int32 [16]: TF_FUSE2's arrival counters ([0] tri_norm.gateRoute's), zero; launches leave them zero
     pick: u64, // int32 [R, slots]
     mw: u64, // fp32 [R, slots]
     // a block whose shared expert runs alone (weights.Layer.shared; zero when none does): the routed slots' picks and
@@ -279,9 +280,14 @@ pub const Round = struct {
         rd.h_alt = try a.take(R * hc * d * 2);
         rd.x = try a.take(R * d * 2);
         rd.part = try a.take(R * tri_basic.hc_blocks * 32 * 4);
-        const hc_cnt = try a.take(64 * 4); // _hc_fused's arrival counters (tri_hc.Sink.cnt), zero; launches leave them zero
+        const hc_cnt = try a.take(64 * 4); // _hc_fused / _hc_chain's arrival counters (tri_hc.Sink.cnt), zero; launches leave them zero
         try prompt.fill(e, hc_cnt, 0, 64 * 4);
         if (std.c.getenv("TF_HC_FUSE")) |v| tri_hc.fuse = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike (default off)
+        if (std.c.getenv("TF_HC_CHAIN")) |v| tri_hc.chain = std.mem.eql(u8, std.mem.span(v), "1"); // idem; needs the kit's _hc_chain
+        rd.f2_cnt = try a.take(16 * 4);
+        try prompt.fill(e, rd.f2_cnt, 0, 16 * 4);
+        // every rank alike (default off): the router's two decode launches as one; needs the kit's _rowmm_route
+        if (std.c.getenv("TF_FUSE2")) |v| tri_norm.fuse2 = std.mem.eql(u8, std.mem.span(v), "1");
         rd.pre = try a.take(R * hc * 4);
         rd.pre_a = try a.take(R * hc * 4);
         rd.pre_f = try a.take(R * hc * 4);
@@ -815,9 +821,9 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const c = e.c;
     const R = rd.r;
     const sl = e.slots();
-    const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     // the shared expert's id, in every row's last slot: the table's last entry, or past it when it runs alone
-    try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - @intFromBool(lay.shared == null), rd.pick, rd.mw, R, c.experts, sl);
+    // (TF_FUSE2: the chunk sums and the routing as one launch, tri_norm.gateRoute)
+    try tri_norm.gateRoute(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, rd.f2_cnt, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - @intFromBool(lay.shared == null), rd.pick, rd.mw, R, c.hidden, c.experts, sl);
     try rd.mark(e, .m_rt);
     if (lay.shared) |sh| {
         // the routed slots through the table, then the shared expert alone added after them (its weight-1 slot last)

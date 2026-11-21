@@ -6,9 +6,10 @@ const rt = @import("hip/root.zig");
 pub const Backend = enum { cuda, hip };
 pub const backend: Backend = .hip;
 
-/// What the family may ask of this backend. CUDA-only launch features are absent; verbs RDMA and the four-node 2D split
-/// are not implemented on HIP (ADAPTER.md sections 2 and 8); vision is vit_hip.zig, opened for text_image only.
-pub const features = .{ .pdl = false, .clusters = false, .vision = true, .verbs_rdma = false, .l2_prefetch = false, .world4 = false };
+/// What the family may ask of this backend. CUDA-only launch features are absent; verbs RDMA is not implemented on HIP
+/// (ADAPTER.md sections 2 and 8), so the four-node 2D split (world4) runs its exchanges over the Coll with ring2d
+/// compiled out; vision is vit_hip.zig, opened for text_image only.
+pub const features = .{ .pdl = false, .clusters = false, .vision = true, .verbs_rdma = false, .l2_prefetch = false, .world4 = true };
 
 pub const abi = rt.abi;
 pub const Driver = rt.Driver;
@@ -36,6 +37,8 @@ pub const graph = rt.graph;
 pub const health = rt.health;
 pub const markFault = rt.markFault;
 pub const abiChecked = rt.abiChecked;
+/// RCCL (gfx1151, built against the same HIP runtime) under NCCL's names: the family's Comm on HIP.
+pub const nccl = @import("hip/rccl.zig");
 
 pub const copyH2D = rt.copyH2D;
 pub const copyD2H = rt.copyD2H;
@@ -79,5 +82,6 @@ test {
     _ = @import("msgpack.zig");
     _ = @import("kernel.zig");
     _ = @import("staging.zig");
+    _ = @import("hip/rccl.zig");
     @import("interface.zig").check(@This());
 }

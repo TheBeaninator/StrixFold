@@ -2,9 +2,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const imprint = @import("prompt_imprint.zig");
+const wire = @import("cache_wire.zig");
 
 /// A family's copy of one state.
 pub const Saved = *anyopaque;
+
+/// A kept state's parts off the engine (POST /cache/export): its slot bytes, then its blocks' rows (as sf-disk).
+pub const Moved = struct { slot: []u8 = &.{}, rows: []u8 = &.{} };
+/// A prompt with images is keyed by its pictures (lanes.image_key): span key ids, and a seal of their whole digests.
+pub const image_key = @import("lanes").image_key;
+pub const Digest = image_key.Digest;
+pub const KeySpan = image_key.KeySpan;
+pub const imageDigest = image_key.imageDigest;
+pub const imageKeyId = image_key.imageKeyId;
+pub const keyIds = image_key.keyIds;
 
 /// What a family gives the cache: copies of its state while the prompt pass stands at a chunk end.
 pub const Snapshots = struct {
@@ -27,14 +38,25 @@ pub const Snapshots = struct {
         trim: ?*const fn (ptr: *anyopaque, room: u64) void = null,
         /// Whether a save at `at` would take spare storage (no new storage).
         reuses: ?*const fn (ptr: *anyopaque, at: u32) bool = null,
+        /// Whether `saved` still restores for a prompt of `len` tokens (null: always). A family whose kept states can
+        /// lose their rows to other requests (a shared pool) answers false for one that did; `len` = maxInt(u32) asks
+        /// whether it restores for any prompt at all.
+        restores: ?*const fn (ptr: *anyopaque, saved: Saved, len: u32) bool = null,
         /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
         write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
         /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
         read: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!Saved = null,
         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
+        /// `saved` copied off the engine in sf-disk's layout (POST /cache/export): slot bytes and block rows, in `gpa`.
+        export_state: ?*const fn (ptr: *anyopaque, saved: Saved, gpa: Allocator, slot: *[]u8, rows: *[]u8) anyerror!void = null,
+        /// A state of `at` positions from an export's parts (POST /cache/import), into new storage on every rank.
+        import_state: ?*const fn (ptr: *anyopaque, at: u32, slot: []const u8, rows: []const u8) anyerror!Saved = null,
     };
 };
+
+/// A kept state off the engine: its positions, the ids it carries (gpa) and its parts (gpa).
+pub const Exported = struct { at: u32, ids: []u32, parts: Moved };
 
 /// What a family's states depend on beyond their position.
 pub const Rules = struct {
@@ -46,6 +68,9 @@ pub const Rules = struct {
     min_gap: u32 = 256,
     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
     min_prompt: u32 = 4096,
+    /// The family keeps only at multiples of this (its chunk ends; 0: at any mark): a mark lands, and a shared cut is
+    /// known by the state it keeps, at the multiple at or before it.
+    grain: u32 = 0,
 };
 
 pub const Entry = struct {
@@ -57,6 +82,7 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    seal: Digest = @splat(0), // the whole digests of the pictures its tokens hold (image_key.sealOf; zero: none)
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -78,6 +104,7 @@ pub const Store = struct {
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+    shape: ?wire.Shape = null, // what the family's states look like on the wire (set by its backend); null: no transfers
 
     const SHARED_KEYS = 64;
 
@@ -105,6 +132,49 @@ pub const Store = struct {
         s.free(e);
     }
 
+    /// The positions of the longest kept state `prompt` resumes (POST /cache/probe): 0 when none.
+    pub fn probe(s: *Store, prompt: []const u32, starts: []const u32) u32 {
+        return if (s.find(prompt, starts)) |e| e.at else 0;
+    }
+
+    /// The longest kept state `prompt` resumes, copied off the engine (POST /cache/export); null when none.
+    pub fn exportState(s: *Store, gpa: Allocator, prompt: []const u32, starts: []const u32) !?Exported {
+        const ex = s.family.vtable.export_state orelse return error.NoTransfer;
+        const e = s.find(prompt, starts) orelse return null;
+        var out: Exported = .{ .at = e.at, .ids = try gpa.dupe(u32, e.tokens), .parts = .{} };
+        errdefer gpa.free(out.ids);
+        try ex(s.family.ptr, e.saved, gpa, &out.parts.slot, &out.parts.rows);
+        return out;
+    }
+
+    /// An exported state of `at` positions taken back as a kept one for `ids` (POST /cache/import); kept once.
+    pub fn importState(s: *Store, ids: []const u32, at: u32, slot: []const u8, rows: []const u8) !u32 {
+        const im = s.family.vtable.import_state orelse return error.NoTransfer;
+        if (at == 0 or ids.len != @as(usize, at) + s.rules.lookahead) return error.BadState;
+        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, ids) and std.mem.allEqual(u8, &e.seal, 0)) return at;
+        const need = s.family.vtable.bytes(s.family.ptr, at);
+        if (need > s.budget) return error.PastBudget;
+        while (s.held + s.spare() + need > s.budget) {
+            s.remove(s.victimBut(null, ids) orelse return error.PastBudget);
+            s.counts.evicted += 1;
+        }
+        const e = try s.gpa.create(Entry);
+        errdefer s.gpa.destroy(e);
+        const tokens = try s.gpa.dupe(u32, ids);
+        errdefer s.gpa.free(tokens);
+        const last = try s.gpa.dupe(u32, ids);
+        errdefer s.gpa.free(last);
+        try s.entries.ensureUnusedCapacity(s.gpa, 1);
+        const saved = try im(s.family.ptr, at, slot, rows);
+        s.clock += 1;
+        const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else need;
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(ids.len), .used = s.clock, .last = last };
+        s.entries.appendAssumeCapacity(e);
+        s.held += charged;
+        s.counts.kept += 1;
+        return at;
+    }
+
     /// The family's free storage kept for later saves.
     pub fn spare(s: *const Store) u64 {
         return if (s.family.vtable.spare) |f| f(s.family.ptr) else 0;
@@ -120,14 +190,53 @@ pub const Store = struct {
         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
     }
 
-    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
+    /// Whether the family still restores `e` for a prompt of `len` tokens (Snapshots.restores).
+    fn restores(s: *const Store, e: *const Entry, len: u32) bool {
+        return if (s.family.vtable.restores) |f| f(s.family.ptr, e.saved, len) else true;
+    }
+
+    /// Kept states the family restores for no prompt any more (their rows went to other requests) go, counted
+    /// evicted. Left in, the longest of them is what `find` hands a later turn of its conversation, which then reads
+    /// its whole prompt again while a shorter state of it still restores.
+    fn sweep(s: *Store) void {
+        if (s.family.vtable.restores == null) return;
+        var i = s.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (s.restores(s.entries.items[i], std.math.maxInt(u32))) continue;
+            s.remove(i);
+            s.counts.evicted += 1;
+        }
+    }
+
+    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left, and
+    /// one the family still restores for it.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+        return s.findSealed(prompt, &.{}, starts);
+    }
+
+    /// find for a prompt with pictures `spans`: a state resumes only when its seal holds the same whole digests.
+    pub fn findSealed(s: *const Store, prompt: []const u32, spans: []const KeySpan, starts: []const u32) ?*Entry {
+        return s.findOf(prompt, spans, starts, true);
+    }
+
+    /// findSealed without asking the family whether the state still restores, so it reads no engine state: a
+    /// submit thread's guess (LaneHost.resumeHint, under cache_lock). A pass that resumes earlier than the guess
+    /// waits for the pictures its encode skipped. (the family's restores reads the lanes'
+    /// kept states, which the engine thread changes without cache_lock.)
+    pub fn guessSealed(s: *const Store, prompt: []const u32, spans: []const KeySpan, starts: []const u32) ?*Entry {
+        return s.findOf(prompt, spans, starts, false);
+    }
+
+    fn findOf(s: *const Store, prompt: []const u32, spans: []const KeySpan, starts: []const u32, ask: bool) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
             if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+            if (ask and !s.restores(e, @intCast(prompt.len))) continue; // (its rows are gone, or it lies inside this prompt's replay)
+            if (!std.mem.eql(u8, &e.seal, &image_key.sealOf(spans, n))) continue;
             best = e;
         }
         return best;
@@ -135,7 +244,7 @@ pub const Store = struct {
 
     /// Before a prompt pass: restore the longest state `prompt` resumes (from 0: none or a failed copy) and plan its marks.
     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque) !Plan {
-        const l = try s.lookup(a, prompt, history_len, shared, starts);
+        const l = try s.lookup(a, prompt, &.{}, history_len, shared, starts);
         const e = l.entry orelse return .{ .marks = l.marks };
         const ok = if (s.family.vtable.restore(s.family.ptr, owner, e.saved)) |_| true else |err| blk: {
             note("restoring {d} tokens failed ({s}); prefilling from the start", .{ e.at, @errorName(err) });
@@ -148,13 +257,14 @@ pub const Store = struct {
     }
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
-    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
-        const e = s.recall(prompt, starts, s.find(prompt, starts));
+    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, spans: []const KeySpan, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
+        s.sweep();
+        const e = s.recall(prompt, starts, s.findSealed(prompt, spans, starts));
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
-            const at = if (s.rules.planned) floorStart(starts, w) else w;
-            if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
+            const at = s.landing(starts, w);
+            if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead], spans);
         }
         s.reserve(prompt, e, marks_);
         return .{ .entry = e, .marks = marks_ };
@@ -179,12 +289,23 @@ pub const Store = struct {
         };
     }
 
-    fn sharedKey(tokens: []const u32) u64 {
-        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
+    /// Where a mark at `w` keeps its state: the chunk start at or before it for planned families, else the grain's
+    /// multiple at or before it (the family's own chunk end), else `w`.
+    fn landing(s: *const Store, starts: []const u32, w: u32) u32 {
+        if (s.rules.planned) return floorStart(starts, w);
+        return if (s.rules.grain > 0) w / s.rules.grain * s.rules.grain else w;
     }
 
-    fn noteShared(s: *Store, tokens: []const u32) void {
-        const k = sharedKey(tokens);
+    /// A shared cut's tokens hashed, with the seal of the pictures they hold (zero: none).
+    fn sharedKey(tokens: []const u32, seal: Digest) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(tokens));
+        if (!std.mem.allEqual(u8, &seal, 0)) h.update(&seal);
+        return h.final();
+    }
+
+    fn noteShared(s: *Store, tokens: []const u32, spans: []const KeySpan) void {
+        const k = sharedKey(tokens, image_key.sealOf(spans, tokens.len));
         if (std.mem.indexOfScalar(u64, s.shared_keys.items, k) != null) return;
         if (s.shared_keys.items.len == SHARED_KEYS) _ = s.shared_keys.orderedRemove(0);
         s.shared_keys.append(s.gpa, k) catch {};
@@ -232,7 +353,7 @@ pub const Store = struct {
         }
         try want.appendSlice(a, shared);
         for (want.items, 0..) |w, k| {
-            const at = if (s.rules.planned) floorStart(starts, w) else w;
+            const at = s.landing(starts, w);
             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
             if (k > 0) { // the history's mark always; the others only away from it, each other and the resume point
                 if (at - from < s.rules.min_gap) continue;
@@ -249,11 +370,22 @@ pub const Store = struct {
 
     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
+        return s.keepSealed(prompt, &.{}, at, owner, starts);
+    }
+
+    /// keep for a prompt with pictures `spans`: the state is sealed with the whole digests of those it holds.
+    pub fn keepSealed(s: *Store, prompt: []const u32, spans: []const KeySpan, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
-        const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+        const seal = image_key.sealOf(spans, n);
+        const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n], seal)) != null;
+        for (s.entries.items, 0..) |e, i| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and std.mem.eql(u8, &e.seal, &seal)) {
+            if (!s.restores(e, std.math.maxInt(u32))) { // the same state, its rows gone since: this pass's copy takes its place
+                s.remove(i);
+                s.counts.evicted += 1;
+                break;
+            }
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
             return true;
@@ -293,7 +425,7 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .seal = seal };
         s.entries.append(s.gpa, e) catch {
             s.free(e);
             return s.fail(at, error.OutOfMemory);
@@ -309,6 +441,7 @@ pub const Store = struct {
     fn learn(s: *Store, e: *const Entry, starts: []const u32) void {
         const im = s.imprint orelse return;
         const write = s.family.vtable.write orelse return;
+        if (!std.mem.allEqual(u8, &e.seal, 0)) return; // learned files carry no seal: a state with pictures stays in memory
         const key = imprint.Imprint.keyOf(e.tokens);
         if (im.has(key) or e.bytes > im.cap) return;
         while (!im.fits(e.bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
@@ -409,4 +542,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
 
 test {
     _ = @import("prompt_cache_test.zig");
+    _ = @import("prompt_cache_transfer_test.zig");
 }

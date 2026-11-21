@@ -90,7 +90,8 @@
    "owner": "w-tri",
    "kit": "dsv41",
    "kernels": [
-    {"id": "aux.sparse_attn", "symbol": "tf_ds_aux_sparse_attn_h32_d512", "spec": {"heads": 32, "hd": 512}, "block": [256, 1, 1], "numerics": "sparse_attn_sink_bf16p", "allow_scratch": true}
+    {"id": "aux.sparse_attn", "symbol": "tf_ds_aux_sparse_attn_h32_d512", "spec": {"heads": 32, "hd": 512}, "block": [256, 1, 1], "numerics": "sparse_attn_sink_bf16p", "allow_scratch": true},
+    {"id": "aux.sparse_attn", "symbol": "tf_ds_aux_sparse_attn_h16_d512", "spec": {"heads": 16, "hd": 512}, "block": [256, 1, 1], "numerics": "sparse_attn_sink_bf16p", "allow_scratch": true}
    ]
   },
   {
@@ -161,7 +162,42 @@
     {"id": "exl3.experts.grouped_rows", "symbol": "tf_ds_exl3_experts_grouped_rows_lo2_hi16", "spec": {"cb": 2, "lo": 2, "hi": 16}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
     {"id": "exl3.experts.grouped_cp", "symbol": "tf_ds_exl3_experts_grouped_cp_lo2_hi16_epi1", "spec": {"cb": 2, "lo": 2, "hi": 16, "epi": 1}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
     {"id": "exl3.experts.grouped_cp", "symbol": "tf_ds_exl3_experts_grouped_cp_lo2_hi16_epi2", "spec": {"cb": 2, "lo": 2, "hi": 16, "epi": 2}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
+    {"id": "exl3.experts.grouped_mma", "symbol": "tf_ds_exl3_experts_grouped_mma_lo8_hi12", "spec": {"cb": 2, "lo": 8, "hi": 12}, "block": [256, 1, 1], "numerics": "exl3.experts_grouped"},
+    {"id": "exl3.experts.grouped_rows", "symbol": "tf_ds_exl3_experts_grouped_rows_lo8_hi12", "spec": {"cb": 2, "lo": 8, "hi": 12}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
+    {"id": "exl3.experts.grouped_cp", "symbol": "tf_ds_exl3_experts_grouped_cp_lo8_hi12_epi1", "spec": {"cb": 2, "lo": 8, "hi": 12, "epi": 1}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
+    {"id": "exl3.experts.grouped_cp", "symbol": "tf_ds_exl3_experts_grouped_cp_lo8_hi12_epi2", "spec": {"cb": 2, "lo": 8, "hi": 12, "epi": 2}, "block": [128, 1, 1], "numerics": "exl3.experts_grouped"},
     {"id": "exl3.l2_prefetch", "symbol": "tf_ds_exl3_l2_prefetch", "block": [256, 1, 1], "numerics": "no_output"}
+    ]
+   },
+   {
+    "source": "exl3_mlp.hip",
+    "owner": "tp4-attn",
+    "kit": "dsv41",
+    "kernels": [
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k4_w4", "spec": {"k2": 4, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k4_w8", "spec": {"k2": 4, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k6_w4", "spec": {"k2": 6, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k6_w8", "spec": {"k2": 6, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k8_w4", "spec": {"k2": 8, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k8_w8", "spec": {"k2": 8, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k10_w4", "spec": {"k2": 10, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k10_w8", "spec": {"k2": 10, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k12_w4", "spec": {"k2": 12, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k12_w8", "spec": {"k2": 12, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k16_w4", "spec": {"k2": 16, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp", "symbol": "tf_ds_exl3_glinear_mlp_k16_w8", "spec": {"k2": 16, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k4_w4", "spec": {"k2": 4, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k4_w8", "spec": {"k2": 4, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k6_w4", "spec": {"k2": 6, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k6_w8", "spec": {"k2": 6, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k8_w4", "spec": {"k2": 8, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k8_w8", "spec": {"k2": 8, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k10_w4", "spec": {"k2": 10, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k10_w8", "spec": {"k2": 10, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k12_w4", "spec": {"k2": 12, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k12_w8", "spec": {"k2": 12, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k16_w4", "spec": {"k2": 16, "cb": 2, "warps": 4}, "block": [128, 1, 1], "lds_dynamic_max": 16384, "numerics": "exl3.linear"},
+    {"id": "exl3.glinear_mlp_lds", "symbol": "tf_ds_exl3_glinear_mlp_lds_k16_w8", "spec": {"k2": 16, "cb": 2, "warps": 8}, "block": [256, 1, 1], "lds_dynamic_max": 32768, "numerics": "exl3.linear"}
     ]
    },
    {

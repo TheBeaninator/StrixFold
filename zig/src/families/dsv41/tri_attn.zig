@@ -105,8 +105,9 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
     const cbase = if (based) a.cbase orelse a.wbase.? else a.pos;
     // switch "attn_pf" (on in the served build): a split's window keys into L2 before its PDL wait
     const wpf = a.ring and !final;
-    const hip = if (t.aux) |x| x.attn else null;
-    if (hip != null and a.h == tri_aux.attn_heads and a.hd == tri_aux.attn_hd and a.window == tri_aux.attn_window and n_idx <= tri_aux.attn_max_idx) {
+    // aux.sparse_attn's build for this rank's heads: 32 (TP2) or 16 (TP4), the same bits a head
+    const hip = if (t.aux) |x| x.attnFor(a.h) else null;
+    if (hip != null and a.hd == tri_aux.attn_hd and a.window == tri_aux.attn_window and n_idx <= tri_aux.attn_max_idx) {
         // aux.sparse_attn: the same keys (and picks list) in one pass, or the same split partials for the merge below
         const flags = @as(i32, @intFromBool(a.ring)) | @as(i32, @intFromBool(has)) << 1 | @as(i32, @intFromBool(pack)) << 2 |
             @as(i32, @intFromBool(final)) << 3 | @as(i32, @intFromBool(based)) << 4;
@@ -327,4 +328,76 @@ test "aux.sparse_attn takes the part launch it fits (the merge stays Triton), an
     try std.testing.expectEqualStrings("aux.sparse_attn", log.items.items[2].name);
     try std.testing.expectEqual(@as(i32, 8), log.hipArgs(tri_aux.AttnArgs, 2).flags);
     try std.testing.expectEqual(@as(i32, 0), log.hipArgs(tri_aux.AttnArgs, 2).n_idx);
+}
+
+test "TP4 ranks (16 heads) take aux.sparse_attn's 16-head build; TP2 launches (32 heads) are what they were" {
+    var f32_: gpu.Function = undefined;
+    var f16_: gpu.Function = undefined;
+    @memset(std.mem.asBytes(&f32_), 0x32);
+    @memset(std.mem.asBytes(&f16_), 0x16);
+    const same = struct {
+        fn f(x: ?gpu.Function, y: gpu.Function) bool {
+            return x != null and std.mem.eql(u8, std.mem.asBytes(&x.?), std.mem.asBytes(&y));
+        }
+    }.f;
+    const old: tri_aux.Aux = .{ .attn = f32_ }; // a kit before the 16-head build
+    const both: tri_aux.Aux = .{ .attn = f32_, .attn16 = f16_ };
+    try std.testing.expect(same(both.attnFor(32), f32_) and same(both.attnFor(16), f16_));
+    try std.testing.expect(both.attnFor(24) == null and both.attnFor(64) == null and old.attnFor(16) == null);
+    const fp4: Comp = .{ .fp4 = .{ .codes = 0x600, .scales = 0x700 } };
+    const prompt: Attn = .{ .q = 0x100, .out = 0x200, .rows = 2048, .h = 32, .hd = 512, .sink = 0x300, .wsrc = 0x400, .wsrc_rows = 2048, .wlo = 0x500, .ring = false, .comp = fp4, .idx = 0x800, .n_idx = 500, .pos = 0x900, .scale = 0.044194173, .window = 128 };
+    var dec = prompt;
+    dec.rows = 4;
+    dec.ring = true;
+    dec.ring_rows = 256;
+    dec.wbase = 0xa00;
+    dec.cbase = 0xb00;
+    dec.n_idx = 64;
+    dec.parts = .{ .pm = 0xc00, .pl = 0xd00, .po = 0xe00 };
+    var cases: [4]Attn = .{ prompt, dec, prompt, dec };
+    cases[2].h = 16;
+    cases[3].h = 16;
+    // TP2: every launch (name, grid, block, argument bytes, Triton args and consts) the same with the 16-head build bound
+    var l_old: tri.Log = .{ .gpa = std.testing.allocator };
+    defer l_old.deinit();
+    var l_new: tri.Log = .{ .gpa = std.testing.allocator };
+    defer l_new.deinit();
+    for (cases[0..2]) |c| {
+        try sparseAttn(.{ .log = &l_old, .aux = &old }, c);
+        try sparseAttn(.{ .log = &l_new, .aux = &both }, c);
+    }
+    try std.testing.expectEqual(@as(usize, 3), l_new.items.items.len); // prompt one pass; decode split + Triton merge
+    try std.testing.expectEqual(l_old.items.items.len, l_new.items.items.len);
+    for (l_old.items.items, l_new.items.items) |x, y| {
+        try std.testing.expectEqualStrings(x.name, y.name);
+        try std.testing.expectEqual(x.grid, y.grid);
+        try std.testing.expectEqual(x.block, y.block);
+        try std.testing.expectEqualSlices(u8, x.hip, y.hip);
+        try std.testing.expectEqual(x.args.len, y.args.len);
+        try std.testing.expectEqual(x.consts.len, y.consts.len);
+    }
+    try std.testing.expectEqual(@as(i32, 32), l_new.hipArgs(tri_aux.AttnArgs, 0).heads);
+    // TP4: the same calls at 16 heads: aux.sparse_attn (heads 16, the same grid and flags), the merge at 16 heads;
+    // with the old kit they stay on Triton's _sparse_attn_part
+    var l4: tri.Log = .{ .gpa = std.testing.allocator };
+    defer l4.deinit();
+    for (cases[2..4]) |c| try sparseAttn(.{ .log = &l4, .aux = &both }, c);
+    try std.testing.expectEqual(@as(usize, 3), l4.items.items.len);
+    try std.testing.expectEqualStrings("aux.sparse_attn", l4.items.items[0].name);
+    try std.testing.expectEqual([3]u32{ 2048, 1, 1 }, l4.items.items[0].grid);
+    try std.testing.expectEqual(@as(u32, 256), l4.items.items[0].block);
+    var a = l4.hipArgs(tri_aux.AttnArgs, 0);
+    try std.testing.expect(a.heads == 16 and a.flags == 2 | 4 | 8 and a.n_idx == 512 and a.splits == 1 and a.out == 0x200);
+    try std.testing.expectEqualStrings("aux.sparse_attn", l4.items.items[1].name);
+    try std.testing.expectEqual([3]u32{ 4, 1, attn_splits }, l4.items.items[1].grid);
+    a = l4.hipArgs(tri_aux.AttnArgs, 1);
+    try std.testing.expect(a.heads == 16 and a.flags == 1 | 2 | 4 | 16 and a.pm == 0xc00 and a.splits == attn_splits);
+    try std.testing.expectEqualStrings("_sparse_attn_merge", l4.items.items[2].name);
+    try std.testing.expectEqual([3]u32{ 4, 1, 1 }, l4.items.items[2].grid); // 16 heads: one head group
+    var l4o: tri.Log = .{ .gpa = std.testing.allocator };
+    defer l4o.deinit();
+    for (cases[2..4]) |c| try sparseAttn(.{ .log = &l4o, .aux = &old }, c);
+    try std.testing.expectEqualStrings("_sparse_attn_part", l4o.items.items[0].name);
+    try std.testing.expectEqualStrings("_sparse_attn_part", l4o.items.items[1].name);
+    try std.testing.expectEqual([3]u32{ 4, 1, attn_splits }, l4o.items.items[1].grid);
 }

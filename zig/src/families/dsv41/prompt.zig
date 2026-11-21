@@ -175,10 +175,19 @@ pub const Engine = struct {
 
 /// A prompt chunk's buffers for up to `cap` rows (model.py _forward_k's and its steps' torch.empty's).
 /// An image span of the prompt: positions [at, at + len), its rows from row `row` of the image rows buffer.
-pub const Span = struct { at: usize, len: usize, row: usize };
+pub const Span = struct {
+    at: usize,
+    len: usize,
+    row: usize,
+
+    /// The image rows buffer's row for the span's position `pos`.
+    pub fn rowOf(sp: Span, pos: usize) usize {
+        return sp.row + (pos - sp.at);
+    }
+};
 
 /// The rows [r0, r1) of the chunk (relative to its start) a span covers, if any.
-fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
+pub fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
     const lo = @max(sp.at, start);
     const hi = @min(sp.at + sp.len, start + n);
     return if (lo < hi) .{ lo - start, hi - start } else null;
@@ -762,7 +771,7 @@ pub fn embedSpans(e: *const Engine, ch: *Chunk) !void {
     const row = c.hidden * 2;
     for (ch.spans) |sp| {
         const o = overlap(sp, ch.start, ch.n) orelse continue;
-        const src = ch.img_rows + (sp.row + (ch.start + o[0] - sp.at)) * row;
+        const src = ch.img_rows + sp.rowOf(ch.start + o[0]) * row;
         for (0..c.hc) |s| try e.ops.copyRows(e.s, src, row, ch.h + (o[0] * c.hc + s) * row, c.hc * row, row, o[1] - o[0]);
     }
 }
@@ -816,6 +825,13 @@ pub var replay_floor = false;
 /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
 /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
 pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize, kv_done: bool) !void {
+    try attentionPrefix(e, ch, cs, sh, li, ring, floor, kv_done);
+    try attentionSuffix(e, ch, li);
+}
+
+/// attention through wo_a, including the ring write and the kv source. wo_b is attentionSuffix, so a 2D zip can
+/// gather between them. attention() is this then that; fillWhole and the TP2 zip call attention().
+pub fn attentionPrefix(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize, kv_done: bool) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -943,6 +959,13 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const dts = [_]exl3_linear.DType{ .bf16, .bf16, .bf16, .bf16 };
         try grouped(e, ch, n, lay.wo_a[0..groups], xs[0..groups], lds[0..groups], outs[0..groups], oss[0..groups], dts[0..groups]);
     }
+}
+
+/// wo_b of the attention prefix's u. 2D: catRank of the column partner's groups, then this pair's columns.
+pub fn attentionSuffix(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const uw = lay.groups * lay.wo_a[0].n;
     if (two2d(e)) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.attnOut(e), .fp32, c.hidden);
     // an edited wo_b (edit.zig): this rank's partial rows edited in place, before the gather sums them
@@ -1124,6 +1147,12 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
 /// issues it, or aux.gate_logits from the fp16 weight as stored), the routing (the shared expert in every row's last
 /// slot) and the routed experts: the partial pm [n, D].
 pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
+    try moeRoute(e, ch, li);
+    try moeBody(e, ch, li);
+}
+
+/// The gate, the routing and routeSpans. moe and moeUp both start here, so the picks match.
+pub fn moeRoute(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -1147,6 +1176,31 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     ch.route_in = if (n <= tri.decode_rows) ch.gl else ch.logits;
     ch.route_kc = kc;
     try routeSpans(e, ch, lay, shared_id, sl, kc);
+}
+
+/// Routing plus gate / up, and no collective. fillSplit2d calls this; moe stays moeRoute then the whole expert pass.
+pub fn moeUp(e: *const Engine, ch: *Chunk, li: usize) !void {
+    try moeRoute(e, ch, li);
+    const t = two2d(e) orelse return error.NotPortedYet;
+    const lay = e.w.layers[li];
+    if (lay.shared != null) return error.NotPortedYet;
+    return t.expertsUp(e, ch, lay);
+}
+
+/// catRank of the intermediate, then down. The half's moeUp has already filled the work lists.
+pub fn moeDown(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const t = two2d(e) orelse return error.NotPortedYet;
+    const lay = e.w.layers[li];
+    if (lay.shared != null) return error.NotPortedYet;
+    return t.expertsDown(e, ch, lay);
+}
+
+fn moeBody(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const n = ch.n;
+    const d = c.hidden;
+    const sl = e.slots();
     if (two2d(e)) |t| {
         if (lay.shared != null) return error.NotPortedYet; // (a dense shared expert on the 2D split)
         return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here

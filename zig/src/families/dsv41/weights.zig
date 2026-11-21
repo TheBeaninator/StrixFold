@@ -18,9 +18,24 @@ const span_piece = 64 << 20;
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
 /// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
 /// plan (linear.py pinned plans), so its columns sum in the slice's K order.
+/// sk_fill: 0 leaves the plan, the launch and the bytes as they are. 1 is TF_DS_TP4_FILL=1 (more K splits,
+/// exl3_linear.planFor). 2 is TF_DS_TP4_FILL=exact (the same plan, exl3.glinear_mlp). 3 is TF_DS_TP4_FILL=exact_lds
+/// (the same plan, exl3.glinear_mlp_lds). Set only on a 2D node's wq_b, wo_a and wo_b.
 /// dense: a projection the checkpoint stores as a bf16 weight [N, K] (a fine-tuned pack's wo_b and shared
 /// w2; checkpoint.zig part "dense"): its rows on the device, words / suh / svh / k2 zero; dense.zig runs it.
-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0, dense: u64 = 0 };
+pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0, dense: u64 = 0, sk_fill: u8 = 0 };
+
+/// TF_DS_TP4_FILL at load, every rank alike (default 0). "1" raises K splits. "exact" keeps the plan and launches
+/// glinear_mlp. "exact_lds" keeps the plan and launches glinear_mlp_lds. TP2 and world 1 never set sk_fill: their
+/// splits have no pair, and a drafter block is loaded as that TP2 split even on a 2D node.
+fn tp4Fill() u8 {
+    const v = std.c.getenv("TF_DS_TP4_FILL") orelse return 0;
+    const s = std.mem.span(v);
+    if (std.mem.eql(u8, s, "1")) return 1;
+    if (std.mem.eql(u8, s, "exact")) return 2;
+    if (std.mem.eql(u8, s, "exact_lds")) return 3;
+    return 0;
+}
 
 /// A block's shared expert run alone (its w2 dense, or EXL3 with an edit of its output: not in the grouped experts'
 /// table): gate and up EXL3 by output columns as the table's entries are split, down by input rows.
@@ -516,6 +531,13 @@ const Loader = struct {
             // the 2D column parts keep their TP2 slices' decode plans
             lay.wq_b.plan_n = @intCast(s.heads(c) * c.head_dim);
             lay.wo_b.plan_n = @intCast(c.hidden);
+            // sk_fill on a short window only (exl3_linear.planFor). A dense wo_b stays on dense.zig.
+            const fill = tp4Fill();
+            if (fill != 0) {
+                if (lay.wq_b.dense == 0) lay.wq_b.sk_fill = fill;
+                if (lay.wo_b.dense == 0) lay.wo_b.sk_fill = fill;
+                for (0..@as(usize, lay.groups)) |g| lay.wo_a[g].sk_fill = fill;
+            }
         }
         if (c.kv_sources.has(i)) {
             lay.comp_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.compressor.wkv", .{p}), null, null);
@@ -692,4 +714,36 @@ test "rank cache span: entries read whole come back byte for byte, the rest one 
     const tail = try L.entry("after");
     try std.testing.expectEqual(@as(usize, 9000), tail.len);
     for (tail) |b| try std.testing.expectEqual(@as(u8, 5), b);
+}
+
+test "TF_DS_TP4_FILL parses 1, exact and exact_lds, and leaves anything else off" {
+    const env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+        extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+    };
+    const key = "TF_DS_TP4_FILL";
+    var saved: [128]u8 = undefined;
+    const keep_len: ?usize = if (env.getenv(key)) |p| blk: {
+        const s = std.mem.span(p);
+        try std.testing.expect(s.len < saved.len);
+        @memcpy(saved[0..s.len], s);
+        break :blk s.len;
+    } else null;
+    defer {
+        if (keep_len) |n| {
+            saved[n] = 0;
+            _ = env.setenv(key, saved[0..n :0].ptr, 1);
+        } else _ = env.unsetenv(key);
+    }
+    _ = env.setenv(key, "1", 1);
+    try std.testing.expectEqual(@as(u8, 1), tp4Fill());
+    _ = env.setenv(key, "exact", 1);
+    try std.testing.expectEqual(@as(u8, 2), tp4Fill());
+    _ = env.setenv(key, "exact_lds", 1);
+    try std.testing.expectEqual(@as(u8, 3), tp4Fill());
+    _ = env.setenv(key, "0", 1);
+    try std.testing.expectEqual(@as(u8, 0), tp4Fill());
+    _ = env.setenv(key, "exact_lds ", 1);
+    try std.testing.expectEqual(@as(u8, 0), tp4Fill());
 }

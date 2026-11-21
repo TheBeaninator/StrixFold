@@ -191,8 +191,9 @@ fn cpuFamilyModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
 }
 
 /// A check that `exe` names no NVIDIA library or driver entry point (they would be dlopen strings, which ldd misses).
+/// NCCL's entry points are not on the list: RCCL keeps their names (gpu/hip/rccl.zig), so libnccl is what marks NCCL.
 fn noNvidia(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
-    const run = b.addSystemCommand(&.{ "sh", "-c", "if strings -a \"$0\" | grep -E 'libcuda\\.so|libnccl|libcublas|libnvrtc|libcudart|cuInit|ncclCommInitRank|cublasCreate'; then echo \"$0 names an NVIDIA library\" >&2; exit 1; fi" });
+    const run = b.addSystemCommand(&.{ "sh", "-c", "if strings -a \"$0\" | grep -E 'libcuda\\.so|libnccl|libcublas|libnvrtc|libcudart|cuInit|cublasCreate'; then echo \"$0 names an NVIDIA library\" >&2; exit 1; fi" });
     run.addArtifactArg(exe);
     run.has_side_effects = true;
     return &run.step;
@@ -213,7 +214,7 @@ fn readelfNotes(b: *std.Build, o: Options, object: std.Build.LazyPath) std.Build
 }
 
 /// The dsv41 kit's HIP sources (registry.json, kit "dsv41") and their code objects' names.
-const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" }, .{ "aux_markov.hip", "aux_markov.hsaco" }, .{ "vision.hip", "vision.hsaco" } };
+const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_mlp.hip", "exl3_mlp.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" }, .{ "aux_markov.hip", "aux_markov.hsaco" }, .{ "vision.hip", "vision.hsaco" } };
 
 /// The engine graph of a HIP server or its host tests: the shared tokenizer, core, lanes and engine API, the HIP `gpu`
 /// module, the dsv41 family over them, and native/hip.zig (the engine host) as `native_engines`.
@@ -243,10 +244,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const triton_kit = b.option([]const u8, "hip-triton-kit", "w-tri's AOT Triton kit (aot.json, hsaco/) folded into the installed dsv41 kit");
     const host = b.graph.host;
     const tool = kitTool(b);
-    const cpu = b.step("dsv41-cpu", "dsv41 CPU tools with no GPU module in their graph: tf-hip-kit; tf-dsv41-check, tf-dsv41-rank-cache, tf-dsv41-engram-check into zig-out/dsv41-cpu/bin");
+    const cpu = b.step("dsv41-cpu", "dsv41 CPU tools with no GPU module in their graph: tf-hip-kit; tf-dsv41-check, tf-dsv41-rank-cache, tf-dsv41-rank-reslice, tf-dsv41-engram-check into zig-out/dsv41-cpu/bin");
     cpu.dependOn(&b.addInstallArtifact(tool, .{}).step);
     const cpu_family = cpuFamilyModule(b, target, optimize);
-    for ([_][2][]const u8{ .{ "tf-dsv41-check", "check_main.zig" }, .{ "tf-dsv41-rank-cache", "rank_cache_main.zig" }, .{ "tf-dsv41-engram-check", "engram_check_main.zig" } }) |t| {
+    for ([_][2][]const u8{ .{ "tf-dsv41-check", "check_main.zig" }, .{ "tf-dsv41-rank-cache", "rank_cache_main.zig" }, .{ "tf-dsv41-rank-reslice", "rank_reslice_main.zig" }, .{ "tf-dsv41-engram-check", "engram_check_main.zig" } }) |t| {
         const exe = b.addExecutable(.{ .name = t[0], .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("zig/src/families/dsv41/{s}", .{t[1]})),
             .target = target,
@@ -316,6 +317,16 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .imports = &.{ .{ .name = "gpu", .module = hip_gpu_host }, .{ .name = "dsv41", .module = familyModule(b, host, .Debug, o, hip_gpu_host, hip_lanes_host, "zig/src/families/dsv41/dsv41.zig") } },
     }) })).step);
     host_test.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cpuFamilyModule(b, host, .Debug) })).step);
+    // the RCCL collectives: the family's NCCL Comm over RCCL on HIP (comm_test.zig): the gfx1151 librccl opened through the
+    // gpu facade, then four ranks over loopback Fans and a host fake of the RCCL calls (no GPU work)
+    const rccl_lib = b.option([]const u8, "rccl-lib", "librccl (gfx1151, TheRock 10.2) that test-dsv41-hip-coll opens (default librccl.so.1, found by the loader)") orelse "librccl.so.1";
+    const coll_step = b.step("test-dsv41-hip-coll", "dsv41 HIP collectives over RCCL: librccl through the gpu facade, four ranks of Comm.coll over loopback links and a host fake (no GPU work); installs tf-dsv41-coll-test");
+    const coll_test = b.addTest(.{ .name = "tf-dsv41-coll-test", .root_module = familyModule(b, host, .Debug, o, hip_gpu_host, hip_lanes_host, "zig/src/families/dsv41/comm_test.zig") });
+    const coll_run = b.addRunArtifact(coll_test);
+    coll_run.setEnvironmentVariable("TF_RCCL_LIB", rccl_lib);
+    coll_run.has_side_effects = true;
+    coll_step.dependOn(&coll_run.step);
+    coll_step.dependOn(&b.addInstallArtifact(coll_test, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/test" } } }).step);
     // the HIP engine host's own tests (native/hip.zig over the whole family graph, as the server links it)
     host_test.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = hipEngines(b, host, .Debug, o).engines })).step);
     // rank 1's process (tf-dsv41-lanes) for HIP: built (not run), and free of NVIDIA library names
@@ -330,6 +341,20 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }) });
     host_test.dependOn(&rank1.step);
     host_test.dependOn(noNvidia(b, rank1));
+    // the server's way out after hipBLAS was opened and closed (no device): its status and its C stdio line arrive
+    const exit_check = b.addExecutable(.{ .name = "tf-dsv41-exit-check", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/dsv41_hip/exit_check.zig"),
+        .target = host,
+        .optimize = .Debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "leave", .module = b.createModule(.{ .root_source_file = b.path("zig/src/server/leave.zig"), .target = host, .link_libc = true }) }},
+    }) });
+    const exit_run = b.addRunArtifact(exit_check);
+    exit_run.addArg(b.pathJoin(&.{ o.rocm, "lib", "libhipblas.so.3" }));
+    exit_run.setEnvironmentVariable("LD_LIBRARY_PATH", b.fmt("{s}/lib:{s}/lib/llvm/lib", .{ o.rocm, o.rocm }));
+    exit_run.expectExitCode(3);
+    exit_run.expectStdOutEqual("exit-check: the library was opened and closed; leaving with 3\n");
+    host_test.dependOn(&exit_run.step);
 
     const gpu_test = b.step("dsv41-hip-gpu-test", "Build tf-dsv41-hip-smoke, tf-dsv41-hip-abi-test, tf-dsv41-hip-glue-test, the test kit and the dsv41 native kit (GPU; run under the GPU lock with tools/dsv41-hip/run_gpu_tests.sh)");
     const smoke_kernels = embedded(b, o, smoke_object, "smoke.hsaco");

@@ -3,6 +3,7 @@
 pub const Config = @import("config.zig").Config;
 pub const native = @import("native.zig");
 pub const rank_cache = @import("rank_cache.zig");
+pub const reslice = @import("reslice.zig");
 pub const plan = @import("plan.zig");
 pub const engram = @import("engram.zig");
 pub const picture = @import("picture.zig");
@@ -41,6 +42,7 @@ pub const rdma = @import("rdma.zig");
 pub const exl3_experts2d = @import("exl3_experts2d.zig");
 pub const exl3_experts2d_rec = @import("exl3_experts2d_rec.zig");
 pub const prompt2d = @import("prompt2d.zig");
+pub const zip2d = @import("zip2d.zig");
 pub const ring2d = @import("ring2d.zig");
 pub const text = @import("text.zig");
 pub const round = @import("round.zig");
@@ -98,6 +100,7 @@ test {
     refAll(exl3_experts2d);
     refAll(exl3_experts2d_rec);
     refAll(prompt2d);
+    refAll(zip2d);
     refAll(ring2d);
     refAll(text);
     refAll(round);

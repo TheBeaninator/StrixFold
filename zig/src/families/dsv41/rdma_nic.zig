@@ -297,3 +297,272 @@ pub fn startBarrier(fan: *const Fan) !void {
     const got = try link.recv(&buf);
     if (!std.mem.eql(u8, got, "rts")) return error.BadInfo;
 }
+
+
+// ---- world 4: one QP per peer over one receive region ----------------------------------------------------
+
+/// A completion as rdma_core.CoreN reads it from its Net (this file's Nics, or the tests' fake fabric).
+pub const Cqe = struct {
+    status: c_int = 0,
+    wr_id: u64 = 0,
+    peer: u32 = 0,
+    /// the immediate, host order (a trailer's: q's low 32 bits; a poison's: the failure code)
+    imm: u32 = 0,
+    byte_len: u32 = 0,
+    with_imm: bool = false,
+};
+/// One local range written at remote_off of the peer's receive region.
+pub const Seg = struct { local: []const u8, remote_off: u64 };
+
+/// One device context, PD, a send CQ and a receive CQ shared by every QP, one MR over the receive region (the slots:
+/// the peers write into it and this rank writes its own blocks out of it), and one RC QP toward each other rank.
+/// It is rdma_core.CoreN's Net: post, postPoison, pollSend, pollRecv, statusText.
+pub const Nics = struct {
+    pub const max_world = 4;
+    api: verbs.Api,
+    ctx: *vabi.Context,
+    pd: *vabi.Pd,
+    cq_send: *vabi.Cq,
+    cq_recv: *vabi.Cq,
+    mr: *vabi.Mr,
+    qps: [max_world]?*vabi.Qp = @splat(null),
+    /// the peers' receive regions (from their Infos), by rank
+    remote_base: [max_world]u64 = @splat(0),
+    remote_rkey: [max_world]u32 = @splat(0),
+    rank: u32,
+    world: u32,
+    gid: [16]u8,
+    gid_index: u8,
+    active_mtu: c_int,
+    psn: u32,
+    rx_base: u64,
+    rx_len: u64,
+
+    /// Everything but the connections: QPs in INIT with their receives posted.
+    pub fn open(v: *const Verbs, name: []const u8, gid_index: u8, rank: u32, world: u32, rx: []u8) Error!Nics {
+        if (world < 3 or world > max_world or rank >= world) return error.BadSetting;
+        const api = v.api;
+        const ctx = try v.openDevice(name);
+        errdefer _ = api.ibv_close_device(ctx);
+        const port = try v.port(ctx, 1);
+        if (port.state != vabi.port_active) {
+            std.log.err("collectives: rdma device {s} port 1 is not active (state {d})", .{ name, port.state });
+            return error.VerbsFailed;
+        }
+        const active_mtu = try pathMtu(port.active_mtu, port.active_mtu);
+        const pd = api.ibv_alloc_pd(ctx) orelse return error.VerbsFailed;
+        errdefer _ = api.ibv_dealloc_pd(pd);
+        // every posted receive of every QP flushes into the receive CQ at close
+        const cq_send = api.ibv_create_cq(ctx, cq_depth, null, null, 0) orelse return error.VerbsFailed;
+        errdefer _ = api.ibv_destroy_cq(cq_send);
+        const cq_recv = api.ibv_create_cq(ctx, @intCast((max_world - 1) * recv_depth + 64), null, null, 0) orelse return error.VerbsFailed;
+        errdefer _ = api.ibv_destroy_cq(cq_recv);
+        const mr = api.ibv_reg_mr(pd, rx.ptr, rx.len, vabi.access_local_write | vabi.access_remote_write) orelse {
+            std.log.err("collectives: ibv_reg_mr over the {d}-byte slots failed (errno {d}; memlock?)", .{ rx.len, std.c._errno().* });
+            return error.VerbsFailed;
+        };
+        errdefer _ = api.ibv_dereg_mr(mr);
+        const gid = try v.gid(ctx, 1, gid_index);
+        var n: Nics = .{ .api = api, .ctx = ctx, .pd = pd, .cq_send = cq_send, .cq_recv = cq_recv, .mr = mr, .rank = rank, .world = world, .gid = gid.raw, .gid_index = gid_index, .active_mtu = active_mtu, .psn = 0, .rx_base = @intFromPtr(rx.ptr), .rx_len = rx.len };
+        var seed: [4]u8 = undefined;
+        if (std.os.linux.getrandom(&seed, seed.len, 0) != seed.len) return error.VerbsFailed;
+        n.psn = std.mem.readInt(u32, &seed, .little) & 0xffffff;
+        errdefer n.destroyQps();
+        for (0..world) |j| {
+            if (j == rank) continue;
+            // two send WRs a gather (data, then the trailer with immediate), one more for a poison
+            var init: vabi.QpInitAttr = .{ .send_cq = cq_send, .recv_cq = cq_recv, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = recv_depth, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 0 }, .qp_type = vabi.qpt_rc };
+            const qp = api.ibv_create_qp(pd, &init) orelse return error.VerbsFailed;
+            n.qps[j] = qp;
+            var a: vabi.QpAttr = .{ .qp_state = vabi.qps_init, .port_num = 1, .qp_access_flags = vabi.access_local_write | vabi.access_remote_write };
+            const m = vabi.mask;
+            if (api.ibv_modify_qp(qp, &a, m.state | m.pkey_index | m.port | m.access_flags) != 0) return error.VerbsFailed;
+            for (0..recv_depth) |_| try n.postRecvOn(@intCast(j));
+        }
+        return n;
+    }
+
+    fn destroyQps(n: *Nics) void {
+        for (&n.qps) |*q| if (q.*) |qp| {
+            _ = n.api.ibv_destroy_qp(qp);
+            q.* = null;
+        };
+    }
+
+    pub fn close(n: *Nics) void {
+        const api = n.api;
+        n.destroyQps();
+        _ = api.ibv_dereg_mr(n.mr);
+        _ = api.ibv_destroy_cq(n.cq_recv);
+        _ = api.ibv_destroy_cq(n.cq_send);
+        _ = api.ibv_dealloc_pd(n.pd);
+        _ = api.ibv_close_device(n.ctx);
+    }
+
+    /// This rank's QP toward rank j, as rank j's QP toward this rank needs it.
+    pub fn info(n: *const Nics, j: u32, nslot: u32, slot_bytes: u64) Info {
+        const qp = n.qps[j] orelse return std.mem.zeroes(Info);
+        return .{ .qpn = qp.qp_num, .psn = n.psn, .rkey = n.mr.rkey, .gid = n.gid, .active_mtu = n.active_mtu, .nslot = nslot, .rx_base = n.rx_base, .rx_len = n.rx_len, .slot_bytes = slot_bytes };
+    }
+
+    /// INIT -> RTR -> RTS of the QP toward rank j, as Nic.connect does it for the one peer.
+    pub fn connect(n: *Nics, j: u32, peer: Info) Error!void {
+        const qp = n.qps[j] orelse return error.BadSetting;
+        const api = n.api;
+        const m = vabi.mask;
+        var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = try pathMtu(n.active_mtu, peer.active_mtu), .dest_qp_num = peer.qpn, .rq_psn = peer.psn, .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
+        a.ah_attr = .{ .grh = .{ .dgid = .{ .raw = peer.gid }, .sgid_index = n.gid_index, .hop_limit = 64, .traffic_class = 0 }, .is_global = 1, .port_num = 1 };
+        if (api.ibv_modify_qp(qp, &a, m.state | m.av | m.path_mtu | m.dest_qpn | m.rq_psn | m.max_dest_rd_atomic | m.min_rnr_timer) != 0) return error.VerbsFailed;
+        a = .{ .qp_state = vabi.qps_rts, .timeout = try qpTimeout(), .retry_cnt = 7, .rnr_retry = 6, .sq_psn = n.psn, .max_rd_atomic = 1 };
+        if (api.ibv_modify_qp(qp, &a, m.state | m.timeout | m.retry_cnt | m.rnr_retry | m.sq_psn | m.max_qp_rd_atomic) != 0) return error.VerbsFailed;
+        n.remote_base[j] = peer.rx_base;
+        n.remote_rkey[j] = peer.rkey;
+    }
+
+    pub fn toErr(n: *Nics) void {
+        for (n.qps) |q| if (q) |qp| {
+            var a: vabi.QpAttr = .{ .qp_state = vabi.qps_err };
+            _ = n.api.ibv_modify_qp(qp, &a, vabi.mask.state);
+        };
+    }
+
+    pub fn statusText(n: *const Nics, status: c_int) []const u8 {
+        return std.mem.span(n.api.ibv_wc_status_str(status));
+    }
+
+    fn postRecvOn(n: *Nics, j: u32) Error!void {
+        const qp = n.qps[j] orelse return error.PostFailed;
+        var sge: vabi.Sge = .{ .addr = n.rx_base, .length = recv_sge_bytes, .lkey = n.mr.lkey };
+        var wr: vabi.RecvWr = .{ .wr_id = j, .sg_list = @ptrCast(&sge), .num_sge = 1 };
+        var bad: ?*vabi.RecvWr = null;
+        if (n.ctx.ops.post_recv(qp, &wr, &bad) != 0) return error.PostFailed;
+    }
+
+    /// The data (an unsignaled write, when there is one) and the trailer (a signaled write with immediate) to rank j,
+    /// in one post: RC delivers them in order, so the trailer's completion at the peer means both are placed.
+    pub fn post(n: *Nics, j: u32, data: ?Seg, trailer: Seg, wr_id: u64, imm: u32) Error!void {
+        const qp = n.qps[j] orelse return error.PostFailed;
+        var sge_t: vabi.Sge = .{ .addr = @intFromPtr(trailer.local.ptr), .length = @intCast(trailer.local.len), .lkey = n.mr.lkey };
+        var wr_t: vabi.SendWr = .{ .wr_id = wr_id, .sg_list = @ptrCast(&sge_t), .num_sge = 1, .opcode = vabi.wr_rdma_write_imm, .send_flags = vabi.send_signaled, .imm_data = std.mem.nativeToBig(u32, imm), .remote_addr = n.remote_base[j] + trailer.remote_off, .rkey = n.remote_rkey[j] };
+        var sge_d: vabi.Sge = undefined;
+        var wr_d: vabi.SendWr = undefined;
+        var first: *vabi.SendWr = &wr_t;
+        if (data) |d| {
+            sge_d = .{ .addr = @intFromPtr(d.local.ptr), .length = @intCast(d.local.len), .lkey = n.mr.lkey };
+            wr_d = .{ .wr_id = wr_id, .next = &wr_t, .sg_list = @ptrCast(&sge_d), .num_sge = 1, .opcode = vabi.wr_rdma_write, .send_flags = 0, .remote_addr = n.remote_base[j] + d.remote_off, .rkey = n.remote_rkey[j] };
+            first = &wr_d;
+        }
+        var bad: ?*vabi.SendWr = null;
+        if (n.ctx.ops.post_send(qp, first, &bad) != 0) return error.PostFailed;
+    }
+
+    /// A zero-byte signaled write with immediate (the failure code) to rank j: its collective has failed.
+    pub fn postPoison(n: *Nics, j: u32, code: u32, wr_id: u64) Error!void {
+        const qp = n.qps[j] orelse return error.PostFailed;
+        var wr: vabi.SendWr = .{ .wr_id = wr_id, .sg_list = undefined, .num_sge = 0, .opcode = vabi.wr_rdma_write_imm, .send_flags = vabi.send_signaled, .imm_data = std.mem.nativeToBig(u32, code), .remote_addr = n.remote_base[j], .rkey = n.remote_rkey[j] };
+        var bad: ?*vabi.SendWr = null;
+        if (n.ctx.ops.post_send(qp, &wr, &bad) != 0) return error.PostFailed;
+    }
+
+    fn peerOf(n: *const Nics, qp_num: u32) u32 {
+        for (n.qps, 0..) |q, j| if (q) |qp| if (qp.qp_num == qp_num) return @intCast(j);
+        return max_world; // not one of ours: CoreN fails the gather with Mismatch
+    }
+
+    pub fn pollSend(n: *Nics, out: []Cqe) isize {
+        var wc: [8]vabi.Wc = undefined;
+        const got = n.ctx.ops.poll_cq(n.cq_send, @intCast(@min(out.len, wc.len)), &wc);
+        if (got < 0) return -1;
+        for (wc[0..@intCast(got)], out[0..@intCast(got)]) |w, *o| o.* = .{ .status = w.status, .wr_id = w.wr_id, .peer = @intCast(w.wr_id & 7) };
+        return got;
+    }
+
+    /// Receive completions, each receive re-posted on its QP (a failed re-post: -1).
+    pub fn pollRecv(n: *Nics, out: []Cqe) isize {
+        var wc: [8]vabi.Wc = undefined;
+        const got = n.ctx.ops.poll_cq(n.cq_recv, @intCast(@min(out.len, wc.len)), &wc);
+        if (got < 0) return -1;
+        for (wc[0..@intCast(got)], out[0..@intCast(got)]) |w, *o| {
+            const j = n.peerOf(w.qp_num);
+            o.* = .{ .status = w.status, .wr_id = w.wr_id, .peer = j, .imm = std.mem.bigToNative(u32, w.imm_data), .byte_len = w.byte_len, .with_imm = w.opcode == wc_recv_rdma_with_imm and (w.wc_flags & vabi.wc_with_imm) != 0 };
+            if (w.status == vabi.wc_success and j < max_world) n.postRecvOn(j) catch return -1;
+        }
+        return got;
+    }
+};
+
+
+/// Every rank's Infos over the star of control links (rank 0 links to each follower): each follower sends rank 0 its
+/// QPs' Infos toward every rank; rank 0 checks they agree on the slots and sends each follower every rank's Info
+/// toward it. Returns the Infos toward this rank, by rank (this rank's own entry zero).
+pub fn exchangeInfoStar(fan: *const Fan, rank: u32, world: u32, mine: [Nics.max_world]Info) ![Nics.max_world]Info {
+    const W = Nics.max_world;
+    if (world < 3 or world > W) return error.BadSetting;
+    const row_bytes = W * @sizeOf(Info);
+    if (rank != 0) {
+        const link = fan.links[0] orelse return error.NoControlLink;
+        try link.send(std.mem.asBytes(&mine));
+        var buf: [row_bytes + 16]u8 = undefined;
+        const got = try link.recv(&buf);
+        if (got.len == 0) return error.Mismatch; // rank 0 refused: the slots differ (logged there)
+        if (got.len != row_bytes) return error.BadInfo;
+        var col: [W]Info = undefined;
+        @memcpy(std.mem.asBytes(&col), got);
+        for (col[0..world], 0..) |inf, j| if (j != rank and inf.magic != info_magic) return error.BadInfo;
+        return col;
+    }
+    var table: [W][W]Info = undefined; // table[i][j]: rank i's QP toward rank j
+    table[0] = mine;
+    for (1..world) |g| {
+        const link = fan.links[g - 1] orelse return error.NoControlLink;
+        var buf: [row_bytes + 16]u8 = undefined;
+        const got = try link.recv(&buf);
+        if (got.len != row_bytes) return error.BadInfo;
+        @memcpy(std.mem.asBytes(&table[g]), got);
+    }
+    var agree = true;
+    for (0..world) |i| for (0..world) |j| {
+        if (i == j) continue;
+        const t = table[i][j];
+        if (t.magic != info_magic) return error.BadInfo;
+        if (t.nslot != mine[1].nslot or t.slot_bytes != mine[1].slot_bytes or t.rx_len != mine[1].rx_len) {
+            std.log.warn("collectives handshake refused: rank {d} has {d} slots of {d} bytes ({d}-byte receive region), rank 0 {d} of {d} ({d})", .{ i, t.nslot, t.slot_bytes, t.rx_len, mine[1].nslot, mine[1].slot_bytes, mine[1].rx_len });
+            agree = false;
+        }
+        _ = pathMtu(t.active_mtu, mine[1].active_mtu) catch {
+            agree = false;
+        };
+    };
+    for (1..world) |g| {
+        const link = fan.links[g - 1] orelse return error.NoControlLink;
+        if (!agree) {
+            link.send("") catch {};
+            continue;
+        }
+        var col: [W]Info = std.mem.zeroes([W]Info);
+        for (0..world) |i| col[i] = if (i == g) std.mem.zeroes(Info) else table[i][g];
+        try link.send(std.mem.asBytes(&col));
+    }
+    if (!agree) return error.Mismatch;
+    var col: [W]Info = std.mem.zeroes([W]Info);
+    for (1..world) |i| col[i] = table[i][0];
+    return col;
+}
+
+/// Every QP in RTS before any rank writes: each follower tells rank 0, rank 0 answers every follower once all did.
+pub fn startBarrierStar(fan: *const Fan, rank: u32, world: u32) !void {
+    var buf: [16]u8 = undefined;
+    if (rank != 0) {
+        const link = fan.links[0] orelse return error.NoControlLink;
+        try link.send("rts");
+        const got = try link.recv(&buf);
+        if (!std.mem.eql(u8, got, "go")) return error.BadInfo;
+        return;
+    }
+    for (1..world) |g| {
+        const link = fan.links[g - 1] orelse return error.NoControlLink;
+        const got = try link.recv(&buf);
+        if (!std.mem.eql(u8, got, "rts")) return error.BadInfo;
+    }
+    for (1..world) |g| try (fan.links[g - 1] orelse return error.NoControlLink).send("go");
+}

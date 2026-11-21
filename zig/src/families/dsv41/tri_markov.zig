@@ -247,8 +247,21 @@ fn modelConfig() !Config {
     return config.parse(std.testing.allocator, config.test_config, &why);
 }
 
-/// The Markov of the case's rank.
+/// The Markov of the case's rank: TP2's, or for a case of a 2D node ("tp4": its TP2 rank r and pair p, variants.py
+/// tp4_cases) the drafter's on its head quarter (draft2d.markov, the vocabulary widths as prompt2d.Two.init takes them).
 fn markovOf(cfg: Config, c: Case, head: u64, emb: u64, none: u64) !Markov {
+    if (c.v.get("tp4")) |q| {
+        const draft2d = @import("draft2d.zig");
+        const s: Split = .{ .rank = @intCast(q.object.get("r").?.integer), .world = tp, .pair = @intCast(q.object.get("p").?.integer) };
+        var two: @import("prompt2d.zig").Two = undefined;
+        two.r = @intCast(s.rank);
+        two.p = @intCast(s.pair.?);
+        for (&two.hw, 0..) |*w, pair| {
+            const cols = s.atPair(@intCast(pair)).headCols(cfg);
+            w.* = cols[1] - cols[0];
+        }
+        return draft2d.markov(cfg, &two, head, emb, none);
+    }
     return Markov.init(cfg, .{ .rank = @intCast(c.v.get("rank").?.integer), .world = tp }, head, emb, none);
 }
 

@@ -2,7 +2,9 @@
 //! ICO, PPM, ...), decoded as the served lane decodes them: Pillow's Image.open(BytesIO(data)).convert("RGB") (the
 //! DeepSeek reference's load_image), in a long-lived `python3 -I` child with the lane's pixel limit, one image at a
 //! time. The pixels are Pillow's own, so they are the lane's when the runtime's Pillow is the lane's (the served
-//! image's 12.3.0). Without python3 and Pillow the child is absent and such images are refused as Pillow refuses
+//! image's 12.3.0). `python3 -I` ignores PYTHONPATH and the user site, so a Pillow that is not the box's own comes by
+//! TF_PIL_PATH (serve_lib.sh sets it to the deploy's pylib/ when the deploy carries one): the child puts it first on
+//! sys.path before it imports PIL. Without python3 and Pillow the child is absent and such images are refused as Pillow refuses
 //! data it cannot identify.
 const std = @import("std");
 const picture = @import("picture.zig");
@@ -12,7 +14,9 @@ const Allocator = std.mem.Allocator;
 /// DecompressionBombError, 2: another error), width, height and the length of what follows (u64 LE each), then the
 /// RGB rows or the error's text. The lane refuses past 134,217,728 pixels: twice Image.MAX_IMAGE_PIXELS.
 pub const script =
-    \\import io, struct, sys, warnings
+    \\import io, os, struct, sys, warnings
+    \\if os.environ.get("TF_PIL_PATH"):
+    \\    sys.path.insert(0, os.environ["TF_PIL_PATH"])
     \\from PIL import Image
     \\warnings.simplefilter("ignore")
     \\Image.MAX_IMAGE_PIXELS = 67108864

@@ -13,7 +13,7 @@ const gpu = @import("gpu");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--round-ms MS,...] [--draft-ms MS] [--streams S] [--modalities text|text_image] [--hip-kit DIR] [--aio 0|1] [--side 0|1] [--logits-sha 0|1] [--logits-dump DIR]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--round-ms MS,...] [--draft-ms MS] [--streams S] [--modalities text|text_image] [--image-tokens N] [--hip-kit DIR] [--aio 0|1] [--side 0|1] [--logits-sha 0|1] [--logits-dump DIR]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -67,8 +67,9 @@ pub fn main(init: std.process.Init) !u8 {
         .master = try dsv41.link.parseIp(args[5]),
         .port = try std.fmt.parseInt(u16, args[6], 10),
         .kit_dir = args[7],
-        .open_coll = if (gpu.backend == .hip) dsv41.tcp_coll.open else null,
     };
+    // HIP: TF_DS_COLL picks w-link's TCP (two ranks) or RCCL (comm.chosen); CUDA: NCCL
+    if (gpu.backend == .hip and try dsv41.comm.chosen(o.world) == .tcp) o.open_coll = dsv41.tcp_coll.open;
     var requests_file: ?[]const u8 = null;
     var parallel: ?usize = null; // default: every stream of the pool
     var arena_gib: ?usize = null;
@@ -128,6 +129,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.rdma_kernels = val;
         } else if (std.mem.eql(u8, key, "--vision-bias")) {
             o.vision_bias = val;
+        } else if (std.mem.eql(u8, key, "--image-tokens")) {
+            o.image_rows = dsv41.model.Model.parseImageRows(val) catch return error.BadArgument;
         } else if (std.mem.eql(u8, key, "--modalities")) {
             o.modalities = std.meta.stringToEnum(dsv41.model.Modalities, val) orelse return error.BadArgument;
         } else if (std.mem.eql(u8, key, "--hip-kit")) {

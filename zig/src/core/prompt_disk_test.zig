@@ -403,7 +403,10 @@ test "the free-space floor and the queue bound skip a save and change nothing" {
     defer p.deinit(gpa);
     try std.testing.expectEqual(pd.Reason.floor, p.result.skip);
     try std.testing.expectEqual(@as(u64, 0), t.bytes);
+    try std.testing.expect(!t.writable() and t.floor_warned); // open warned once: the tier is on and writes nothing
+    try std.testing.expectEqual(@as(u64, 1), t.counts.floor);
     t.cfg.free_override = 1 << 40;
+    try std.testing.expect(t.writable());
     t.cfg.queue = 6 * block_bytes; // the blocks fit, the state's own bytes do not
     var q = try save(t, &keys);
     defer q.deinit(gpa);

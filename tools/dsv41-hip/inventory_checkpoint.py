@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate local safetensors headers and emit the exact TP1/TP2 rank-file schema.
+"""Validate local safetensors headers and emit the exact TP1/TP2/TP4 (2D) rank-file schema.
 
 No tensor weight payload is materialized. MUL1 marker words alone are read to
 verify the codebook. File/content provenance is distinct from header validation.
@@ -157,9 +157,17 @@ def quant_inventory(tensors: dict) -> tuple[list, dict]:
 
 
 def rank_plan(raw: dict, tensors: dict, rank: int, world: int = 2, dspark=True) -> dict:
-    """Port of pinned plan.zig TP1/TP2 wants() and checkpoint.describe()."""
-    if world not in (1, 2) or rank not in range(world):
-        raise InputError("only TP1 or TP2 rank schemas are supported")
+    """Port of pinned plan.zig wants() and checkpoint.describe(): TP over 1 or 2 ranks, the exact 2D split over 4.
+
+    World 4 is plan.zig Split.node: node g is TP2 rank g % 2 inside pair g // 2 and keeps its pair's whole
+    128-column blocks of each of that TP2 rank's split outputs (pair 0 the larger part; experts' down: 20 blocks for
+    pair 0, TF_DS_2D_DOWN); DSpark stays TP2 inside the pair. The file is still rank g of 4."""
+    if world not in (1, 2, 4) or rank not in range(world):
+        raise InputError("only TP1, TP2 or TP4 (2D) rank schemas are supported")
+    node, nodes = rank, world
+    pair = rank // 2 if world == 4 else None
+    if world == 4:
+        rank, world = rank % 2, 2
     c = raw.get("text_config", raw)
     need = lambda key: checked_int(c.get(key), key, 1)
     d, heads, hd = need("hidden_size"), need("num_attention_heads"), need("head_dim")
@@ -219,7 +227,32 @@ def rank_plan(raw: dict, tensors: dict, rank: int, world: int = 2, dspark=True) 
             offset += size
 
     span = lambda per: (rank * per, (rank + 1) * per)
+
+    def cut(r, first=None):
+        """plan.zig Split.cut: the pair's part of r in whole 128-column blocks."""
+        blocks = (r[1] - r[0]) // 128
+        mid = r[0] + ((blocks + 1) // 2 if first is None else first) * 128
+        return (r[0], mid) if pair == 0 else (mid, r[1])
+
+    def pair_part(r, first=None):
+        return cut(r, first) if pair is not None and two_d else r
+
+    two_d = True
+    hc_mult = need("hc_mult") if pair is not None else 0
+
     def block(prefix, layer, expert_count):
+        if two_d:
+            gl = groups // world
+            wo_a = range(rank * gl + pair * (gl // 2), rank * gl + pair * (gl // 2) + gl // 2) if pair is not None \
+                else range(rank * gl, (rank + 1) * gl)
+            wo_b_cols = cut((0, d)) if pair is not None else None
+            gu = pair_part(span(width // world))
+            down_cols = cut((0, d), 20) if pair is not None else None
+            eng_cols = cut((0, (hc_mult + 1) * d)) if pair is not None else None
+        else:
+            wo_a = range(rank * groups // world, (rank + 1) * groups // world)
+            wo_b_cols = down_cols = eng_cols = None
+            gu = span(width // world)
         for hc in ("hc_attn", "hc_ffn"):
             for part in ("fn", "scale", "base"):
                 plain(f"{prefix}.{hc}_{part}", "F32")
@@ -227,13 +260,13 @@ def rank_plan(raw: dict, tensors: dict, rank: int, world: int = 2, dspark=True) 
         plain(prefix + ".ffn_norm.weight")
         exl3(prefix + ".attn.wq_a", k=d, n=qlora)
         plain(prefix + ".attn.q_norm.weight")
-        exl3(prefix + ".attn.wq_b", cols=span(heads // world * hd), k=qlora)
+        exl3(prefix + ".attn.wq_b", cols=pair_part(span(heads // world * hd)), k=qlora)
         exl3(prefix + ".attn.wkv", k=d, n=hd)
         plain(prefix + ".attn.kv_norm.weight")
         plain(prefix + ".attn.attn_sink", "F32")
-        for g in range(rank * groups // world, (rank + 1) * groups // world):
+        for g in wo_a:
             exl3(f"{prefix}.attn.wo_a.slice.{g}", k=heads // groups * hd, n=olora)
-        exl3(prefix + ".attn.wo_b", rows=span(groups // world * olora), n=d)
+        exl3(prefix + ".attn.wo_b", cols=wo_b_cols, rows=span(groups // world * olora), n=None if wo_b_cols else d)
         if layer in kv:
             exl3(prefix + ".attn.compressor.wkv", k=d)
             plain(prefix + ".attn.compressor.norm.weight")
@@ -251,24 +284,25 @@ def rank_plan(raw: dict, tensors: dict, rank: int, world: int = 2, dspark=True) 
         plain(prefix + ".ffn.gate.bias", "F32")
         for e in range(expert_count + 1):
             ep = f"{prefix}.ffn.experts.{e}" if e < expert_count else prefix + ".ffn.shared_experts"
-            exl3(ep + ".w1", cols=span(width // world), k=d)
-            exl3(ep + ".w3", cols=span(width // world), k=d)
-            exl3(ep + ".w2", rows=span(width // world), n=d)
+            exl3(ep + ".w1", cols=gu, k=d)
+            exl3(ep + ".w3", cols=gu, k=d)
+            exl3(ep + ".w2", cols=down_cols, rows=span(width // world), n=None if down_cols else d)
         if layer in eng:
             rows = (need("engram_max_ngram_size") - 1) * need("engram_n_heads")
             if rows % world:
                 raise InputError("Engram hash columns not divisible by world")
-            exl3(prefix + ".engram.wkv", rows=span(rows // world * need("engram_head_dim")))
+            exl3(prefix + ".engram.wkv", cols=eng_cols, rows=span(rows // world * need("engram_head_dim")))
             plain(prefix + ".engram.q_weight", "F32")
             plain(prefix + ".engram.k_weight", "F32")
 
     plain("embed.weight")
     plain("norm.weight")
-    exl3("head", cols=span(vocab // world), k=d)
+    exl3("head", cols=pair_part(span(vocab // world)), k=d)
     layers = need("num_hidden_layers")
     for layer in range(layers):
         block(f"layers.{layer}", layer, need("n_routed_experts"))
     if dspark and c.get("dspark_block_size", 0) > 0:
+        two_d = False  # DSpark stays TP2 inside the pair (plan.zig wants: load_block at world 2)
         drafts = need("num_nextn_predict_layers")
         for stage in range(drafts):
             block(f"mtp.{stage}", layers + stage, need("dspark_n_routed_experts"))
@@ -278,11 +312,11 @@ def rank_plan(raw: dict, tensors: dict, rank: int, world: int = 2, dspark=True) 
         for suffix in ("norm.weight", "markov_head.embed.weight", "markov_head.head.weight", "confidence_head.proj.weight"):
             plain(last + "." + suffix)
     encoded = json.dumps(entries).encode()
-    return {"rank": rank, "world": world, "dspark": dspark, "entries": entries,
+    return {"rank": node, "world": nodes, "dspark": dspark, "entries": entries,
             "entry_count": len(entries), "data_bytes": offset,
             "index_sha256": hashlib.sha256(encoded).hexdigest(), "index_bytes": len(encoded),
             "rank_file_bytes": offset + len(encoded) + 16,
-            "schema": "TFDSRK01", "schema_source": "pinned plan.zig TP1/TP2; no TP4 parity"}
+            "schema": "TFDSRK01", "schema_source": "pinned plan.zig TP1/TP2 and the 2D split (TF_DS_2D_GU=first); no TP4 parity"}
 
 
 def inventory(model: Path, lock: dict | None, include_plans=True, world=2, verify_content=False) -> dict:
@@ -324,7 +358,7 @@ def main() -> int:
                     help="explicitly allow small/other local fixtures; never proves pinned checkpoint coverage")
     ap.add_argument("--no-rank-plans", action="store_true")
     ap.add_argument("--verify-content", action="store_true", help="stream every required file and compare pinned HF blob hashes")
-    ap.add_argument("--world", type=int, choices=(1, 2), default=2)
+    ap.add_argument("--world", type=int, choices=(1, 2, 4), default=2)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
     try:

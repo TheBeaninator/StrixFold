@@ -1,5 +1,6 @@
 //! w-tri's HIP kernels in place of Triton launches and hipBLAS GEMMs (HIP builds; TF_DS_AUX, default hip):
-//!   aux.sparse_attn  for _sparse_attn_part: split partials (the Triton merge kernels unchanged) or one pass
+//!   aux.sparse_attn  for _sparse_attn_part: split partials (the Triton merge kernels unchanged) or one pass; built
+//!                    for 32 heads a rank (TP2) and 16 (TP4), the same bits a head
 //!   aux.index_rows   for the indexer's scores without a base or candidates (_index_score_rows; _index_score of a
 //!                    prompt chunk of at most 16 rows)
 //!   aux.hc_mix_pf    for _hc_mix_pf at every row count (a token's bits never depend on the chunk it landed in:
@@ -65,8 +66,10 @@ pub const MarkovRaceArgs = extern struct { lg: u64, tok: u64, slot: u64, cache: 
 /// aux.markov_race's block: a row a workgroup.
 pub const markov_race_block = 1024;
 
-/// The kernels' compiled shapes (registry.json's specs) and limits.
+/// The kernels' compiled shapes (registry.json's specs) and limits. aux.sparse_attn has two builds: 32 heads a rank
+/// (TP2) and 16 (TP4: attn16_heads).
 pub const attn_heads = 32;
+pub const attn16_heads = 16;
 pub const attn_hd = 512;
 pub const attn_window = 128;
 /// aux.sparse_attn reads at most this many picks a row (it clamps, so a longer list keeps the Triton launch).
@@ -145,13 +148,23 @@ pub const Which = struct {
 
 /// The bound kernels (null: that launch stays Triton, or the GEMM hipBLAS).
 pub const Aux = struct {
-    attn: ?gpu.Function = null,
+    attn: ?gpu.Function = null, // aux.sparse_attn, 32 heads a rank (TP2)
+    attn16: ?gpu.Function = null, // aux.sparse_attn, 16 heads a rank (TP4); null when the kit predates it
     index: ?gpu.Function = null,
     hc_mix: ?gpu.Function = null,
     gate: ?gpu.Function = null, // aux.gate_logits, ne a multiple of 64 (the router)
     gate32: ?gpu.Function = null, // aux.gate_logits, ne = 32 (the indexer's head weights)
     rope: ?gpu.Function = null,
     markov_race: ?gpu.Function = null, // the drafter's Markov step of a sampled pass (tri_markov.raceBest; no Triton form)
+
+    /// aux.sparse_attn's build for h heads a rank (32 or 16); null for another head count or a build not bound
+    pub fn attnFor(x: Aux, h: usize) ?gpu.Function {
+        return switch (h) {
+            attn_heads => x.attn,
+            attn16_heads => x.attn16,
+            else => null,
+        };
+    }
 };
 
 /// aux.index_rows' grid: groups of 8 rows by key-tile ranges, about 240 workgroups in all.

@@ -1,6 +1,10 @@
-//! The TP ranks' collectives: NCCL opened at run time, its unique id passed from rank 0 over the link. Every model
-//! reduction is an all-gather of fp32 partials that each rank then adds in rank order (DESIGN.md section 3), so the
-//! ranks hold the same bits without a broadcast.
+//! The TP ranks' collectives: NCCL opened at run time (CUDA; RCCL on HIP, gpu/hip/rccl.zig, the same calls), its
+//! unique id passed from rank 0 over the link. Every model reduction is an all-gather of fp32 partials that each rank
+//! then adds in rank order (DESIGN.md section 3), so the ranks hold the same bits without a broadcast.
+//!
+//! On HIP, TF_DS_COLL picks the transport (chosen): "rccl" this Comm, "tcp" w-link's host-staged TCP (tcp_coll.zig,
+//! two ranks, or three and four with TF_COLL_KIND=rdma: rdma_proxy.zig's star, rdma_proxy at four ranks); unset, world 4 takes RCCL
+//! and world 2 keeps TCP.
 const std = @import("std");
 const gpu = @import("gpu");
 const Link = @import("link.zig").Link;
@@ -8,6 +12,26 @@ const Fan = @import("fan.zig").Fan;
 const coll_mod = @import("coll.zig");
 
 const nccl = gpu.nccl;
+
+/// Which transport a HIP rank opens (TF_DS_COLL; see the file head). CUDA always runs NCCL.
+pub const Choice = enum { nccl, tcp };
+
+pub fn chosen(world: u32) error{BadColl}!Choice {
+    if (gpu.backend == .cuda) return .nccl;
+    const v = std.mem.span(std.c.getenv("TF_DS_COLL") orelse return if (world > 2) .nccl else .tcp);
+    if (v.len == 0) return if (world > 2) .nccl else .tcp;
+    if (std.mem.eql(u8, v, "rccl") or std.mem.eql(u8, v, "nccl")) return .nccl;
+    if (std.mem.eql(u8, v, "tcp")) return if (world <= 2 or rdmaKind()) .tcp else error.BadColl;
+    return error.BadColl;
+}
+
+/// TF_COLL_KIND=rdma: tcp_coll.open hands the Coll to rdma_proxy.zig, which runs at 3 and 4 ranks (its handshake
+/// checks the world); host and proxy are two-rank only (the RDMA arm's ranks all exited
+/// BadColl here).
+fn rdmaKind() bool {
+    const k = std.c.getenv("TF_COLL_KIND") orelse return false;
+    return std.mem.eql(u8, std.mem.span(k), "rdma");
+}
 
 pub const Comm = struct {
     lib: nccl.Library,
@@ -38,9 +62,14 @@ pub const Comm = struct {
         return .{ .lib = lib, .comm = comm, .rank = rank, .world = world };
     }
 
-    /// Comm over every link of a fan: rank 0 makes the id and sends it to each follower. Needs the CUDA context current.
+    /// Comm over every link of a fan: rank 0 makes the id and sends it to each follower. Needs the GPU context current.
     pub fn fromFan(f: *const Fan, rank: u32, world: u32) !Comm {
-        var lib = try nccl.Library.open();
+        return fromFanWith(try nccl.Library.open(), f, rank, world);
+    }
+
+    /// fromFan over a library the caller opened (or a host fake of its calls, tests); the Comm owns it.
+    pub fn fromFanWith(opened: nccl.Library, f: *const Fan, rank: u32, world: u32) !Comm {
+        var lib = opened;
         errdefer lib.close();
         var id: nccl.UniqueId = undefined;
         if (world > 1) {
@@ -60,10 +89,11 @@ pub const Comm = struct {
     }
 
     /// This communicator as the family's collectives (coll.zig): bytes moved as u8, which is what an all-gather or an
-    /// exchange of any type is. NCCL's calls are graph-capturable; NCCL carries no header, so the site is not checked
-    /// against the peer's. `c` must outlive the Coll.
+    /// exchange of any type is. NCCL's calls are graph-capturable (RCCL's under hipStreamBeginCapture too: the TP4 first light
+    /// confirms it with TF_DS_GRAPHS=1); NCCL carries no header, so the site is not checked against the peer's. `c`
+    /// must outlive the Coll.
     pub fn coll(c: *Comm) coll_mod.Coll {
-        return .{ .ptr = c, .vtable = &coll_vtable, .rank = c.rank, .world = c.world, .capturable = true };
+        return .{ .ptr = c, .vtable = &coll_vtable, .rank = c.rank, .world = c.world, .capturable = true, .vgather = c.world == 4 and coll_mod.vgatherFromEnv() };
     }
 
     const coll_vtable: coll_mod.Coll.VTable = .{ .all_gather = collGather, .exchange = collExchange, .abort = collAbort, .close = collClose };

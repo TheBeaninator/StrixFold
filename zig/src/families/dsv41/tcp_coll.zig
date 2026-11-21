@@ -25,8 +25,11 @@
 //!   TF_COLL_GPU_WAIT_S  a GPU wait longer than this many seconds fails the collective (1-600, default 10): tcp_host's
 //!                     host waits (this rank's block reaching pinned memory, the previous upload) and tcp_proxy's
 //!                     device waits (a free slot, the peer's block)
-//! and one that is this rank's own (not compared): TF_COLL_GPU_WARN_S (0-600, default 2; 0: never), a GPU wait longer
-//! than this many seconds is logged when it ends, one line (rank, operation, site, bytes, chunk, ms, outcome)
+//! and two that are this rank's own (not compared): TF_COLL_GPU_WARN_S (0-600, default 2; 0: never), a GPU wait longer
+//! than this many seconds is logged when it ends, one line (rank, operation, site, bytes, chunk, ms, outcome); and
+//! TF_COLL_WIRE_THREADS (1 or 2, default 1): 2 moves a striped exchange's second link on a helper thread
+//! (tcp_wire.zig Helper) while the caller moves the first, so with two data links (TF_TP_STRIPE) a large gather's
+//! chunks have two cores for their socket copies instead of one; the bytes on each link are the same either way
 const std = @import("std");
 const gpu = @import("gpu");
 const coll = @import("coll.zig");
@@ -100,6 +103,9 @@ pub const TcpColl = struct {
     reason: std.atomic.Value(u32) = .init(0),
     /// the gather begun by gatherBegin, which gatherEnd exchanges
     begun: ?Begun = null,
+    /// what the exchanges have moved each way, and the time spent inside them (coll.Coll.Counts host_bytes, host_ns)
+    xchg_bytes: u64 = 0,
+    xchg_ns: u64 = 0,
     /// the upload `uploaded` marks (its gather), for waitUploaded's log line
     uploading: Wait = .{ .op = "upload", .site = .{ .phase = .test_only, .layer = 0 }, .bytes = 0 },
 
@@ -107,7 +113,7 @@ pub const TcpColl = struct {
 
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
         const t: *TcpColl = @ptrCast(@alignCast(ptr));
-        return .{ .host = t.w.seq };
+        return .{ .host = t.w.seq, .host_bytes = t.xchg_bytes, .host_ns = t.xchg_ns };
     }
 
     fn check(ptr: *anyopaque) coll.Error!void {
@@ -216,6 +222,8 @@ pub const TcpColl = struct {
             });
             return t.mapWire(e);
         };
+        t.xchg_bytes += tx.len;
+        t.xchg_ns += wire.monotonicNs() -| t0;
     }
 
     fn waitUploaded(t: *TcpColl) coll.Error!void {
@@ -381,6 +389,11 @@ pub fn settingsFromEnv(control_port: u16) !Settings {
     s.chunk = @max(1, try envInt(usize, "TF_COLL_CHUNK_MIB", 4)) << 20;
     s.gpu_wait_ns = try envSeconds("TF_COLL_GPU_WAIT_S", 10, 1, 600);
     s.gpu_warn_ns = try envSeconds("TF_COLL_GPU_WARN_S", 2, 0, 600);
+    s.opt.threads = try envInt(u8, "TF_COLL_WIRE_THREADS", 1);
+    if (s.opt.threads < 1 or s.opt.threads > wire.max_links) {
+        std.log.warn("collectives: TF_COLL_WIRE_THREADS={d} refused: 1 (the caller moves every link) or {d} (a thread a link)", .{ s.opt.threads, wire.max_links });
+        return error.BadSetting;
+    }
     return s;
 }
 
@@ -498,6 +511,71 @@ pub fn handshake(fan: *const Fan, id: *const coll.Identity, extra: []const u8) !
     return se;
 }
 
+/// The handshake at world 3 or 4 over the star of control links (rank 0 links to each follower; the
+/// followers do not link to each other): every follower sends rank 0 its hello and identity text; rank 0 compares each
+/// with its own (logging every key that differs, as handshake does), and answers every follower with the verdict and
+/// the session epoch (the XOR of all the ranks' nonces). Refuses with Mismatch on every rank when any rank differs.
+pub fn handshakeStar(fan: *const Fan, id: *const coll.Identity, extra: []const u8) !Session {
+    if (id.world < 3 or id.world > 4 or id.rank >= id.world) return error.UnsupportedWorld;
+    const first: Link = fan.links[0] orelse return error.NoControlLink;
+    const ends = try controlEnds(first.fd, id.rank);
+    // rank 0 listens on PORT + g - 1 for follower g (fan.zig): every rank names PORT, so the settings compare equal
+    const port = if (id.rank == 0) ends.port else ends.port - @as(u16, @intCast(id.rank - 1));
+    var se: Session = .{ .epoch = undefined, .addrs = undefined, .links = 1, .settings = try settingsFromEnv(port) };
+    se.addrs[0] = ends.ip;
+    var nonce: [16]u8 = undefined;
+    if (std.os.linux.getrandom(&nonce, nonce.len, 0) != nonce.len) return error.NoRandom;
+    var hello: [24]u8 = undefined;
+    std.mem.writeInt(u32, hello[0..4], hello_magic, .little);
+    std.mem.writeInt(u32, hello[4..8], id.rank, .little);
+    @memcpy(hello[8..24], &nonce);
+    var text_buf: [2048]u8 = undefined;
+    const base = try identityText(&text_buf, id, se.settings, se.links);
+    const mine = try std.fmt.bufPrint(text_buf[base.len..], "{s} {s}", .{ base, extra });
+    std.mem.copyForwards(u8, text_buf[0..mine.len], mine);
+    const line = text_buf[0..mine.len];
+    if (id.rank != 0) {
+        try first.send(&hello);
+        try first.send(line);
+        var in_buf: [64]u8 = undefined;
+        const verdict = try first.recv(&in_buf);
+        if (verdict.len != 20 or std.mem.readInt(u32, verdict[0..4], .little) != hello_magic) return error.Mismatch; // refused (logged on rank 0)
+        @memcpy(&se.epoch, verdict[4..20]);
+        if (std.mem.allEqual(u8, &se.epoch, 0)) return error.Mismatch;
+        return se;
+    }
+    se.epoch = nonce;
+    var equal = true;
+    for (1..id.world) |g| {
+        const link: Link = fan.links[g - 1] orelse return error.NoControlLink;
+        var in_buf: [1280]u8 = undefined;
+        const peer_hello = try link.recv(&in_buf);
+        if (peer_hello.len != 24 or std.mem.readInt(u32, peer_hello[0..4], .little) != hello_magic or
+            std.mem.readInt(u32, peer_hello[4..8], .little) != g) return error.Mismatch;
+        for (&se.epoch, peer_hello[8..24]) |*e, b| e.* ^= b;
+        var peer_buf: [1280]u8 = undefined;
+        const theirs = try link.recv(&peer_buf);
+        if (!compareText(line, theirs)) {
+            std.log.warn("collectives handshake: rank {d} differs from rank 0 in the settings listed above", .{g});
+            equal = false;
+        }
+    }
+    if (std.mem.allEqual(u8, &se.epoch, 0)) equal = false;
+    var verdict: [20]u8 = undefined;
+    std.mem.writeInt(u32, verdict[0..4], if (equal) hello_magic else 0, .little);
+    @memcpy(verdict[4..20], &se.epoch);
+    for (1..id.world) |g| {
+        const link: Link = fan.links[g - 1] orelse return error.NoControlLink;
+        try link.send(&verdict);
+    }
+    if (!equal) {
+        // warn, not err: the refusal is the open's error, which the caller reports (and the host tests drive it)
+        std.log.warn("collectives handshake refused: the ranks differ in the settings listed above", .{});
+        return error.Mismatch;
+    }
+    return se;
+}
+
 /// tcp_host over the session's data links (`port_offset` past the data port: the proxy keeps its own wire).
 pub fn openHost(gpa: std.mem.Allocator, d: *const gpu.Driver, rank: u32, se: Session, port_offset: u16) !*TcpColl {
     const s = se.settings;
@@ -519,6 +597,12 @@ pub fn openHost(gpa: std.mem.Allocator, d: *const gpu.Driver, rank: u32, se: Ses
     while (made < ready.len) : (made += 1) ready[made] = try gpu.Event.init(d, false);
     t.* = .{ .gpa = gpa, .d = d, .rank = rank, .w = w, .staged = staged, .uploaded = uploaded, .gpu_wait_ns = s.gpu_wait_ns, .gpu_warn_ns = s.gpu_warn_ns, .staging = s.staging, .copy = copy, .start = start, .chunk_ready = ready, .pipe_min = s.pipe_min, .chunk = s.chunk };
     std.log.info("collectives: tcp_host over {d} data link(s) from port {d}, stripe >= {d} MiB, RTO floor {d} us, progress deadline {d} ms, GPU waits fail after {d} s (logged past {d} s), {s} staging, gathers >= {d} MiB pipelined in {d} MiB chunks", .{ se.links, s.data_port + port_offset, s.opt.stripe_min >> 20, s.opt.rto_min_us, s.opt.progress_ns / std.time.ns_per_ms, s.gpu_wait_ns / std.time.ns_per_s, s.gpu_warn_ns / std.time.ns_per_s, @tagName(s.staging), s.pipe_min >> 20, s.chunk >> 20 });
+    if (s.opt.threads > 1) {
+        if (se.links > 1)
+            std.log.info("collectives: tcp_host moves a striped exchange on {d} threads, one a data link (TF_COLL_WIRE_THREADS)", .{s.opt.threads})
+        else
+            std.log.warn("collectives: TF_COLL_WIRE_THREADS={d} changes nothing on one data link (TF_TP_STRIPE is unset)", .{s.opt.threads});
+    }
     return t;
 }
 
@@ -560,9 +644,19 @@ test "TF_COLL_GPU_WAIT_S and TF_COLL_GPU_WARN_S: whole seconds in range, the def
     };
     defer _ = env.unsetenv("TF_COLL_GPU_WAIT_S");
     defer _ = env.unsetenv("TF_COLL_GPU_WARN_S");
+    defer _ = env.unsetenv("TF_COLL_WIRE_THREADS");
     _ = env.unsetenv("TF_COLL_GPU_WAIT_S");
     _ = env.unsetenv("TF_COLL_GPU_WARN_S");
+    _ = env.unsetenv("TF_COLL_WIRE_THREADS");
     var s = try settingsFromEnv(29600);
+    try std.testing.expectEqual(@as(u8, 1), s.opt.threads); // one thread when unset
+    _ = env.setenv("TF_COLL_WIRE_THREADS", "2", 1);
+    try std.testing.expectEqual(@as(u8, 2), (try settingsFromEnv(29600)).opt.threads);
+    for ([_][*:0]const u8{ "0", "3", "two", "" }) |bad| {
+        _ = env.setenv("TF_COLL_WIRE_THREADS", bad, 1);
+        try std.testing.expectError(error.BadSetting, settingsFromEnv(29600));
+    }
+    _ = env.unsetenv("TF_COLL_WIRE_THREADS");
     try std.testing.expectEqual(@as(u64, 10 * ns), s.gpu_wait_ns); // unchanged when unset
     try std.testing.expectEqual(@as(u64, 2 * ns), s.gpu_warn_ns);
     _ = env.setenv("TF_COLL_GPU_WAIT_S", "60", 1);
@@ -597,4 +691,8 @@ test "the GPU wait deadline is in the handshake, the warn threshold is not" {
     var loud = base;
     loud.gpu_warn_ns = 0;
     try std.testing.expect(compareText(ten, try identityText(&b1, &id, loud, 1)));
+    // nor the wire's thread count: a rank on two threads pairs with one on one
+    var threaded = base;
+    threaded.opt.threads = 2;
+    try std.testing.expect(compareText(ten, try identityText(&b1, &id, threaded, 1)));
 }

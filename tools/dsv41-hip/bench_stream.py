@@ -8,6 +8,7 @@ same rate counted in events (a token whose text is empty or split sends none), p
 A failed case is recorded with its error and the others still run. OUT gets every case with its reply and the server's
 /metrics after the last; stdout one JSON line without them."""
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -23,8 +24,13 @@ def prefill_prompt(repeat):
 
 
 def run(url, name, prompt, max_tokens, timeout):
-    body = json.dumps({"model": name, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
-                       "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}).encode()
+    req_body = {"model": name, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
+                "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
+    # BENCH_DRAFT=0: the request asks for no drafts ("draft": false), so one drafts-on launch also gives the drafts-off
+    # figure; unset: the server's default, as before
+    if os.environ.get("BENCH_DRAFT") == "0":
+        req_body["draft"] = False
+    body = json.dumps(req_body).encode()
     req = urllib.request.Request(url + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     t0 = time.monotonic()
     first = last = None

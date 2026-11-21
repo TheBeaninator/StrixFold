@@ -82,7 +82,7 @@ pub const Status = enum(u8) { pending, complete };
 pub const StateRec = struct { k: u32, bytes: u64, used: i128, status: Status, keys: []Key };
 pub const BlockRec = struct { bytes: u64, refs: u32 = 0, status: Status, pinned: bool = false, guard: bool = false };
 
-/// A resume's answer on one rank, and the pair's outcome from both.
+/// A resume's answer on one rank, and the outcome from every rank's (Outcome.of a pair's, ofAll the four-node split's).
 pub const Load = enum(u8) {
     ok = 0,
     bad = 1, // missing or corrupt: both ranks forget the state
@@ -98,8 +98,20 @@ pub const Outcome = enum(u8) {
     forget = 2,
 
     pub fn of(a: Load, b: Load) Outcome {
-        if (a == .ok and b == .ok) return .hit;
-        if (a == .bad or b == .bad) return .forget;
+        return ofAll(a, &.{b});
+    }
+
+    /// Rank 0's answer and its followers' (rank 1, or ranks 1-3 on the four-node split): a hit only when every rank
+    /// read its part, a forget when any found its part bad, else a miss (a part still being written somewhere).
+    pub fn ofAll(mine: Load, theirs: []const Load) Outcome {
+        var all_ok = mine == .ok;
+        var any_bad = mine == .bad;
+        for (theirs) |t| {
+            all_ok = all_ok and t == .ok;
+            any_bad = any_bad or t == .bad;
+        }
+        if (all_ok) return .hit;
+        if (any_bad) return .forget;
         return .miss;
     }
 };
@@ -112,8 +124,9 @@ pub const Config = struct {
     floor: u64 = 16 << 30,
     queue: u64 = 1 << 30,
     rate: u64 = 1 << 30, // the writer's bytes a second at most (0: no cap)
-    follower: bool = false, // rank 1: refuses what passes its budget instead of evicting
+    follower: bool = false, // rank 1: refuses what passes its budget or its floor instead of evicting (it mirrors rank 0's)
     free_override: ?u64 = null, // tests: the free bytes the filesystem reports
+    free_fn: ?*const fn (dir: [:0]const u8) u64 = null, // tests: the free bytes as a function of the tier's dir (a filling disk)
     drain_ns: u64 = 20 * std.time.ns_per_s, // close: how long the queued writes may still run
     block_tokens: u64 = 2048, // a block's positions (log lines' tokens=)
 };
@@ -138,7 +151,7 @@ pub const Plan = struct {
 pub const Job = union(enum) {
     run: struct { keys: []Key, first_j: u32, data: []u8, charge: u64, t0: i128 },
     state: struct { key: Key, k: u32, keys: []Key, slot: []u8, charge: u64, t0: i128, new_blocks: u32, new_bytes: u64 },
-    delete: struct { states: []Key, blocks: []Key },
+    delete: struct { states: []Key, blocks: []Key, bytes: u64 = 0 }, // bytes: the files' (Tier.unlinking until unlinked)
     sweep: struct { name: [32]u8 },
 };
 
@@ -155,6 +168,8 @@ pub const Counts = struct {
     skipped: u64 = 0,
     failed: u64 = 0,
     evicted: u64 = 0,
+    evicted_floor: u64 = 0, // of evicted: to keep the free-space floor (the rest kept the budget)
+    floor: u64 = 0, // of skipped: the free-space floor's (no write fits above cfg.floor)
 };
 
 /// One rank's store; in a TP pair rank 0 decides saves, evictions and resumes and rank 1 mirrors them.
@@ -180,6 +195,7 @@ pub const Tier = struct {
     jobs: Fifo(Job) = .{},
     done: std.ArrayList(Done) = .empty,
     queued: u64 = 0,
+    unlinking: u64 = 0, // the bytes of this tier's files queued for deletion and not yet unlinked
     stop: bool = false,
     running: bool = false, // the writer holds a job
     deadline: i128 = 0,
@@ -187,6 +203,7 @@ pub const Tier = struct {
     written: std.atomic.Value(u64) = .init(0), // the writer's totals (its own lines)
     clock: i128 = 0, // the last `used` handed out (wall ns, strictly increasing)
     lock: c_int = -1, // IDENTITY, flock'ed shared while open: no other tier's sweep takes this namespace
+    floor_warned: bool = false, // the floor's warning is logged once a tier (at open, or at the first save it skips)
 
     pub const readState = index.readState;
     pub const readRun = index.readRun;
@@ -216,6 +233,11 @@ pub const Tier = struct {
         errdefer t.freeIndex();
         try index.scan(t);
         namespace.scanOthers(t, identity);
+        if (!t.writable()) {
+            // the tier is on but cannot write: say so where an operator looks, not only in each save's info line
+            t.floor_warned = true;
+            t.warn("event=floor at=open free_mib={d} floor_mib={d}: no save fits above the free-space floor even with this tier's own states evicted, so every save skips (reason=floor) until the filesystem has room", .{ t.freeBytes() >> 20, cfg.floor >> 20 });
+        }
         t.thread = try std.Thread.spawn(.{}, writer.writer, .{t});
         return t;
     }
@@ -324,7 +346,24 @@ pub const Tier = struct {
     /// The bytes on the root's filesystem a writer may still use (statvfs, less nothing).
     pub fn freeBytes(t: *const Tier) u64 {
         if (t.cfg.free_override) |v| return v;
+        if (t.cfg.free_fn) |f| return f(t.dir);
         return fsFree(t.dir);
+    }
+
+    /// True when the smallest save (one block and its state file) fits above the free-space floor, on rank 0 after
+    /// evicting every state of its own (the follower evicts only what rank 0 evicts).
+    pub fn writable(t: *const Tier) bool {
+        const own: u64 = if (t.cfg.follower) 0 else t.bytes;
+        return t.freeBytes() + own >= t.cfg.floor + t.runFiles(1) + t.stateFile(1);
+    }
+
+    /// The free bytes a plan may count on: the filesystem's, plus this tier's files queued for deletion (an eviction's
+    /// room before the writer unlinks them), less the writes still queued (they land before the plan's own).
+    pub fn room(t: *Tier) u64 {
+        const free = t.freeBytes();
+        _ = c.pthread_mutex_lock(&t.mu);
+        defer _ = c.pthread_mutex_unlock(&t.mu);
+        return (free + t.unlinking) -| t.queued;
     }
 
     pub fn queueRoom(t: *Tier) u64 {
@@ -367,32 +406,33 @@ pub const Tier = struct {
         const charge_ = missing * (t.block_bytes + 32) + (if (state) kk * 32 + t.slot_bytes else 0);
         const files = t.runFiles(missing) + (if (state) t.stateFile(kk) else 0);
         if (charge_ > t.queueRoom()) return t.skipped(.queue);
-        if (t.freeBytes() < t.cfg.floor + files) return t.skipped(.floor);
-        if (t.bytes + t.others_bytes + files > t.cfg.budget) {
-            namespace.sweepOthers(t, files);
+        const need = t.cfg.floor + files;
+        // the floor: the follower refuses below it; the leader evicts its own states for it, unless even all of them
+        // would not make the room (another tenant filled the disk: its own states stay)
+        if (t.room() < need and (t.cfg.follower or t.room() + t.bytes < need)) return t.skipped(.floor);
+        if (t.bytes + t.others_bytes + files > t.cfg.budget) namespace.sweepOthers(t, files);
+        if (t.cfg.follower) {
             // the follower refuses what passes its budget; the leader evicts and tells it (plan.victims)
-            if (t.cfg.follower) {
-                if (t.bytes + t.others_bytes + files > t.cfg.budget + t.cfg.budget / 16) return t.skipped(.budget);
-            } else {
-                // the leader evicts the least recently used; this plan's blocks stay unless the plan is refused
-                for (keys) |k| if (t.blocks.getPtr(k)) |b| {
-                    b.guard = true;
-                };
-                var stands = false;
-                defer t.unguard(keys, !stands);
-                while (t.bytes + t.others_bytes + files > t.cfg.budget) {
-                    const v = t.victim() orelse break;
-                    try victims.append(gpa, v);
-                    t.dropState(v);
-                    t.counts.evicted += 1;
-                }
-                if (t.bytes + t.others_bytes + files > t.cfg.budget) {
-                    var p = t.skipped(.budget);
+            if (t.bytes + t.others_bytes + files > t.cfg.budget + t.cfg.budget / 16) return t.skipped(.budget);
+        } else if (t.bytes + t.others_bytes + files > t.cfg.budget or t.room() < need) {
+            // the leader evicts the least recently used of its own states for the budget and the floor; this plan's
+            // blocks stay unless the plan is refused
+            for (keys) |k| if (t.blocks.getPtr(k)) |b| {
+                b.guard = true;
+            };
+            var stands = false;
+            defer t.unguard(keys, !stands);
+            while (true) {
+                const why: Reason = if (t.bytes + t.others_bytes + files > t.cfg.budget) .budget else if (t.room() < need) .floor else break;
+                const v = t.victim() orelse {
+                    var p = t.skipped(why);
                     p.victims = try victims.toOwnedSlice(gpa);
                     return p;
-                }
-                stands = true;
+                };
+                try victims.append(gpa, v);
+                t.evict(v, why);
             }
+            stands = true;
         }
         // the plan stands: blocks pending, the state pending with its references, the queue reserved
         try t.blocks.ensureUnusedCapacity(gpa, @intCast(missing));
@@ -432,11 +472,18 @@ pub const Tier = struct {
             b.guard = false;
             if (reclaim and b.refs == 0 and !b.pinned) t.forgetBlock(k, &del);
         };
-        t.pushDelete(&.{}, del.toOwnedSlice(t.gpa) catch &.{});
+        t.pushDelete(&.{}, 0, del.toOwnedSlice(t.gpa) catch &.{});
     }
 
     fn skipped(t: *Tier, why: Reason) Plan {
         t.counts.skipped += 1;
+        if (why == .floor) {
+            t.counts.floor += 1;
+            if (!t.floor_warned) {
+                t.floor_warned = true;
+                t.warn("event=floor at=save free_mib={d} floor_mib={d}: a save skipped for the free-space floor (logged once; the event=save lines say reason=floor)", .{ t.freeBytes() >> 20, t.cfg.floor >> 20 });
+            }
+        }
         return .{ .result = .{ .skip = why } };
     }
 
@@ -483,7 +530,7 @@ pub const Tier = struct {
         if (gone.items.len == 0) return;
         var del: std.ArrayList(Key) = .empty;
         for (gone.items) |k| t.forgetBlock(k, &del);
-        t.pushDelete(&.{}, del.toOwnedSlice(t.gpa) catch return);
+        t.pushDelete(&.{}, 0, del.toOwnedSlice(t.gpa) catch return);
     }
 
     /// A block found missing or corrupt: every state on disk that lists it goes (each would fail the same way).
@@ -510,6 +557,7 @@ pub const Tier = struct {
     fn dropState(t: *Tier, key: Key) void {
         const kv = t.states.fetchRemove(key) orelse return;
         t.bytes -|= kv.value.bytes;
+        const state_bytes = kv.value.bytes;
         var del: std.ArrayList(Key) = .empty;
         for (kv.value.keys) |bk| if (t.blocks.getPtr(bk)) |b| {
             b.refs -|= 1;
@@ -520,7 +568,7 @@ pub const Tier = struct {
             del.deinit(t.gpa);
             return;
         };
-        t.pushDelete(states, del.toOwnedSlice(t.gpa) catch &.{});
+        t.pushDelete(states, state_bytes, del.toOwnedSlice(t.gpa) catch &.{});
     }
 
     fn forgetBlock(t: *Tier, key: Key, del: ?*std.ArrayList(Key)) void {
@@ -528,8 +576,18 @@ pub const Tier = struct {
         t.bytes -|= b.value.bytes;
         if (del) |d| d.append(t.gpa, key) catch {} else {
             const one = t.gpa.dupe(Key, &.{key}) catch return;
-            t.pushDelete(&.{}, one);
+            t.pushDelete(&.{}, 0, one);
         }
+    }
+
+    /// Rank 0 evicts state `key` (its own, complete) for `why` (the budget or the floor): its files go, a line says so.
+    fn evict(t: *Tier, key: Key, why: Reason) void {
+        const s = t.states.get(key) orelse return;
+        const before = t.bytes;
+        t.dropState(key);
+        t.counts.evicted += 1;
+        if (why == .floor) t.counts.evicted_floor += 1;
+        t.line("event=evict reason={s} tokens={d} freed_mib={d} room_mib={d} floor_mib={d} states={d} evicted={d} evicted_floor={d} key={s}", .{ @tagName(why), s.k * t.cfg.block_tokens, (before - t.bytes) >> 20, t.room() >> 20, t.cfg.floor >> 20, t.states.count(), t.counts.evicted, t.counts.evicted_floor, &short(key) });
     }
 
     /// The least recently used state on disk (pending ones are never evicted).
@@ -575,6 +633,12 @@ pub const Tier = struct {
     pub fn line(t: *const Tier, comptime fmt: []const u8, args: anytype) void {
         if (builtin.is_test) return;
         std.log.info("sf-disk: rank={d} " ++ fmt, .{t.rank} ++ args);
+    }
+
+    /// As line, at warning level: the tier is on but writes nothing (tests stay quiet).
+    pub fn warn(t: *const Tier, comptime fmt: []const u8, args: anytype) void {
+        if (builtin.is_test) return;
+        std.log.warn("sf-disk: rank={d} " ++ fmt, .{t.rank} ++ args);
     }
 };
 

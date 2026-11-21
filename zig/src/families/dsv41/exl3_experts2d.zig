@@ -47,6 +47,61 @@ pub const Plan = struct {
     }
 };
 
+/// A 2D node's prompt experts on the AMD kit's w-pf kernels (exl3_experts.pfPlan): TP2's rank runs those for every
+/// prompt chunk its table takes them for, and the mma / rows launches below sum K in another order, so a node takes
+/// them too or no column has the rank's bits (prompts of 64 rows and more differed).
+/// gu: count, place, rot and gate / up for this node's ig columns (K D) into sc.xd [R * slots, ig], sorted order; then
+/// the caller's cat_rank of xd into xd_full; down: down over xd_full [R * slots, I] for this node's dn columns and the
+/// combine into out [R, dn]. Every gu / down program owns whole 128-column strips (128-aligned here) and reads only
+/// their trellis tiles and scale rows (stacked at this node's widths, weights.zig), over all of K in the rank's order,
+/// and the grouping (count, place) is a function of pick alone: each element has the rank's bits. Null when the
+/// rank's own plan would be (TP2 then takes the mma launches, and so does the node).
+pub const PfPlans = struct { gu: X.PfPlan, down: X.PfPlan };
+
+pub fn pfPlans(ex: weights.Experts, sc: X.Scratch, x: u64, x_stride: usize, pick: u64, wts: u64, xd_full: u64, out: u64, r: usize, limit: f32) ?PfPlans {
+    if (r < X.exact_rows or r > sc.rows) return null;
+    _ = X.pfPlanOf(ex, sc, x, x_stride, pick, wts, out, r, limit, ex.dims, ex.down_k) orelse return null; // the rank's
+    const gu = X.pfPlanOf(ex, sc, x, x_stride, pick, wts, out, r, limit, ex.dims, ex.width) orelse return null;
+    var dn = X.pfPlanOf(ex, sc, x, x_stride, pick, wts, out, r, limit, ex.down_n, ex.down_k) orelse return null;
+    dn.args.xd = xd_full;
+    return .{ .gu = gu, .down = dn };
+}
+
+test "a 2D node's prompt experts on the AMD kit: the rank's w-pf launches at this node's widths" {
+    // node 3 (pair 1, TP2 rank 1): gate / up columns 1792-2304 of the half (512), down columns 2560-5120
+    var ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 1, .up_ptr = 2, .down_ptr = 3, .gate_k2 = 11, .up_k2 = 12, .down_k2 = 13, .suh_g = 4, .suh_u = 5, .svh_g = 6, .svh_u = 7, .suh_d = 8, .svh_d = 9, .count = 385, .dims = 5120, .width = 512, .down_k = 1152, .down_n = 2560, .k2_gu = .{ 6, 8 }, .k2_d = .{ 6, 10 } };
+    var sc: X.Scratch = undefined;
+    sc.slots = 7;
+    sc.rows = 4096;
+    sc.xd = 0x500;
+    try std.testing.expect(pfPlans(ex, sc, 0x100, 5120, 0x200, 0x300, 0x600, 0x400, 2048, 10) == null); // no masks: mma, as on TP2
+    ex.k2_masks = .{ 1 << 6 | 1 << 8, 1 << 6 | 1 << 10 };
+    try std.testing.expect(pfPlans(ex, sc, 0x100, 5120, 0x200, 0x300, 0x600, 0x400, 63, 10) == null); // a decode window
+    const pl = pfPlans(ex, sc, 0x100, 5120, 0x200, 0x300, 0x600, 0x400, 2048, 10).?;
+    // the grouping is the rank's: the same jobs as its own plan
+    var rank = ex;
+    rank.width = 1152;
+    rank.down_n = 5120;
+    const rp = X.pfPlan(rank, sc, 0x100, 5120, 0x200, 0x300, 0x400, 2048, 10).?;
+    for ([_]X.PfPlan{ pl.gu, pl.down }) |p| {
+        try std.testing.expectEqual(rp.nm, p.nm);
+        try std.testing.expectEqual(rp.args.maxjobs, p.args.maxjobs);
+        try std.testing.expectEqualSlices(u32, rp.k2_gu[0..rp.n_gu], p.k2_gu[0..p.n_gu]);
+        try std.testing.expectEqualSlices(u32, rp.k2_d[0..rp.n_d], p.k2_d[0..p.n_d]);
+    }
+    try std.testing.expectEqual(@as(u32, 5120), pl.gu.args.d);
+    try std.testing.expectEqual(@as(u32, 512), pl.gu.args.i);
+    try std.testing.expectEqual(@as(u64, 0x500), pl.gu.args.xd);
+    try std.testing.expectEqual(@as(u32, 2560), pl.down.args.d);
+    try std.testing.expectEqual(@as(u32, 1152), pl.down.args.i);
+    try std.testing.expectEqual(@as(u64, 0x600), pl.down.args.xd);
+    try std.testing.expectEqual(@as(u32, 2560), pl.down.args.ldo);
+    try std.testing.expectEqual(@as(usize, 2048 * 2560 / 4 / 256), pl.down.grids[3]);
+    // a half the kernels cannot take (down's columns not whole 256-column pairs): null, the mma launches
+    ex.down_n = 2432;
+    try std.testing.expect(pfPlans(ex, sc, 0x100, 5120, 0x200, 0x300, 0x600, 0x400, 2048, 10) == null);
+}
+
 /// experts2d.gateup on a prompt chunk (R >= 64): the grouping (TP2's, by pick only), the rotated rows, gate and up for
 /// this node's columns, the epilogue (TP2's values on them) into sc.xd [R * slots, ig] fp16. x bf16 [R, D] (row stride
 /// x_stride elements), pick int32 [R, slots]; sc sized for this node's width.
@@ -208,7 +263,7 @@ pub fn gateUpLaunches(ex: weights.Experts, sc: X.DecodeScratch, x: u64, x_stride
     gu.add(X.DecodeEpi{ .pick = pick, .E = @intCast(w.e), .svh_g = ex.svh_g, .svh_u = ex.svh_u, .suh_d = ex.suh_d, .xd = sc.xd, .limit = limit, .act_mode = X.act_f32, .cnt = sc.cnt_gu, .discard = @intFromBool(8 * w.sk <= 32) });
     return .{
         .{ .kernel = .prep, .cfg = .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = X.prep_threads }, .shared = @intCast(2 * w.p * 4) }, .args = prep },
-        .{ .kernel = .gate_up, .range = X.range(ex.k2_gu[0], ex.k2_gu[1]), .cfg = .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(w.ig / 128), .z = @intCast(2 * w.sk * w.mt) }, .block = .{ .x = 4 * 32 }, .pdl = true }, .args = gu },
+        .{ .kernel = .gate_up, .range = X.range(ex.k2_gu[0], ex.k2_gu[1]), .cfg = .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(w.ig / 128), .z = @intCast(2 * w.sk * w.mt) }, .block = .{ .x = 4 * 32 }, .pdl = gpu.features.pdl }, .args = gu },
     };
 }
 
@@ -223,7 +278,7 @@ pub fn downLaunch(ex: weights.Experts, sc: X.DecodeScratch, xd_full: u64, pick: 
     for ([_]u64{ xd_full, xd_full, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
     for ([_]usize{ w.i, w.dn, w.p, 1, r, w.slots }) |v| i32a(&dn, v);
     dn.add(X.DecodeEpi{ .pick = pick, .E = @intCast(w.e), .svh_d = ex.svh_d, .y = sc.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .discard = @intFromBool(4 * w.slots <= 32) });
-    return .{ .kernel = .down, .range = X.range(ex.k2_d[0], ex.k2_d[1]), .cfg = .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(w.dn / 128), .z = @intCast(w.mt) }, .block = .{ .x = 4 * 32 }, .pdl = true }, .args = dn };
+    return .{ .kernel = .down, .range = X.range(ex.k2_d[0], ex.k2_d[1]), .cfg = .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(w.dn / 128), .z = @intCast(w.mt) }, .block = .{ .x = 4 * 32 }, .pdl = gpu.features.pdl }, .args = dn };
 }
 
 fn function(k: *const X.Kernels, l: *const X.DecodeLaunch) !gpu.Function {

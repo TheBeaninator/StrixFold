@@ -26,15 +26,21 @@ pub fn push(t: *Tier, j: Job) void {
     t.jobs.push(t.gpa, j) catch {
         var x = j;
         t.queued -|= charge(&x);
+        t.unlinking -|= unlinkBytes(&x);
         t.done.append(t.gpa, .{ .job = x, .ok = false }) catch freeJob(t.gpa, &x);
         return;
     };
     _ = c.pthread_cond_signal(&t.cv);
 }
 
-pub fn pushDelete(t: *Tier, states: []Key, blocks: []Key) void {
+/// States (their files `state_bytes` together) and blocks queued for unlinking; their bytes count as room until then.
+pub fn pushDelete(t: *Tier, states: []Key, state_bytes: u64, blocks: []Key) void {
     if (states.len == 0 and blocks.len == 0) return;
-    push(t, .{ .delete = .{ .states = states, .blocks = blocks } });
+    const bytes = state_bytes + blocks.len * (head_bytes + t.block_bytes);
+    _ = c.pthread_mutex_lock(&t.mu);
+    t.unlinking += bytes;
+    _ = c.pthread_mutex_unlock(&t.mu);
+    push(t, .{ .delete = .{ .states = states, .blocks = blocks, .bytes = bytes } });
 }
 
 /// The writer thread: jobs in order until stopped and empty (or past the close's deadline).
@@ -57,6 +63,7 @@ pub fn writer(t: *Tier) void {
         freePayload(t.gpa, &j);
         _ = c.pthread_mutex_lock(&t.mu);
         t.queued -|= ch;
+        t.unlinking -|= unlinkBytes(&j);
         t.running = false;
         t.done.append(t.gpa, .{ .job = j, .ok = ok, .reason = reason }) catch freeJob(t.gpa, &j);
         _ = c.pthread_mutex_unlock(&t.mu);
@@ -214,6 +221,14 @@ pub fn charge(j: *const Job) u64 {
     return switch (j.*) {
         .run => |r| r.charge,
         .state => |s| s.charge,
+        else => 0,
+    };
+}
+
+/// A delete's bytes (Tier.unlinking holds them until the writer has unlinked its files).
+pub fn unlinkBytes(j: *const Job) u64 {
+    return switch (j.*) {
+        .delete => |d| d.bytes,
         else => 0,
     };
 }

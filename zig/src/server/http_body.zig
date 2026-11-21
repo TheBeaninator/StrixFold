@@ -5,7 +5,7 @@ const errors = @import("errors.zig");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
-pub const limit = 32 * 1024 * 1024;
+pub const limit = 256 * 1024 * 1024; // 64 full-size base64 pictures fit one request; the queue byte cap (TF_QUEUE_MIB) still bounds memory
 const metadata_limit = 65536;
 
 /// A body, or the refusal a RequestError carries (the connection then closes).
@@ -29,6 +29,25 @@ fn strip(s: []const u8) []const u8 {
     while (start < end and isSpace(s[start])) start += 1;
     while (end > start and isSpace(s[end - 1])) end -= 1;
     return s[start..end];
+}
+
+/// The one Content-Length a request declares, or null: none, several that differ, not a number, or chunked.
+pub fn contentLength(c: *const Conn) ?u64 {
+    var size: ?u64 = null;
+    for (c.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Transfer-Encoding")) return null;
+        if (!std.ascii.eqlIgnoreCase(h.name, "Content-Length")) continue;
+        var it = std.mem.splitScalar(u8, h.value, ',');
+        while (it.next()) |raw| {
+            const value = strip(raw);
+            if (value.len == 0 or value.len > 4300) return null;
+            for (value) |ch| if (!std.ascii.isDigit(ch)) return null;
+            const n = std.fmt.parseInt(u64, value, 10) catch std.math.maxInt(u64);
+            if (size != null and size.? != n) return null;
+            size = n;
+        }
+    }
+    return size;
 }
 
 /// Reads one body without consuming the next request on the connection.

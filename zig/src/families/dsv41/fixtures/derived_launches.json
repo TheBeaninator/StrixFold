@@ -160,6 +160,156 @@
      true
     ]
    }
+  },
+  {
+   "consts": {
+    "BP": 256,
+    "PDL": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: draft2d.markov's head quarter, pair 0: 253 segments of 128 (n_part)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:draft_batch_capture:s1",
+   "rank": 0,
+   "scalars": {
+    "n_part": 253,
+    "o_stride": 6,
+    "send": 1
+   },
+   "tensors": {
+    "OUT": [
+     "int64",
+     [
+      1
+     ],
+     [
+      6
+     ],
+     false
+    ],
+    "PI": [
+     "int32",
+     [
+      1,
+      253
+     ],
+     [
+      253,
+      1
+     ],
+     true
+    ],
+    "PV": [
+     "float32",
+     [
+      1,
+      253
+     ],
+     [
+      253,
+      1
+     ],
+     true
+    ],
+    "SEND": [
+     "float32",
+     [
+      1,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ]
+   },
+   "tp4": {
+    "p": 0,
+    "r": 0
+   }
+  },
+  {
+   "consts": {
+    "BP": 256,
+    "PDL": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: draft2d.markov's head quarter, pair 0: 253 segments of 128 (n_part)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:draft_batch_capture:s1:markov odd step",
+   "rank": 0,
+   "scalars": {
+    "n_part": 253,
+    "o_stride": 6,
+    "send": 1
+   },
+   "tensors": {
+    "OUT": [
+     "int64",
+     [
+      1
+     ],
+     [
+      6
+     ],
+     true
+    ],
+    "PI": [
+     "int32",
+     [
+      1,
+      253
+     ],
+     [
+      253,
+      1
+     ],
+     true
+    ],
+    "PV": [
+     "float32",
+     [
+      1,
+      253
+     ],
+     [
+      253,
+      1
+     ],
+     true
+    ],
+    "SEND": [
+     "float32",
+     [
+      1,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ]
+   },
+   "tp4": {
+    "p": 0,
+    "r": 0
+   }
   }
  ],
  "_gather_tiles": [
@@ -4201,6 +4351,110 @@
      true
     ]
    }
+  },
+  {
+   "consts": {
+    "PDL": true,
+    "WORLD": 4
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: draft2d's Markov pick over the four nodes' bests (WORLD 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 1,
+   "phase": "tp4:draft_batch_capture:s1",
+   "rank": 0,
+   "scalars": {
+    "n_rows": 1,
+    "o_stride": 6
+   },
+   "tensors": {
+    "G": [
+     "float32",
+     [
+      4,
+      1,
+      4
+     ],
+     [
+      4,
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "int64",
+     [
+      1
+     ],
+     [
+      6
+     ],
+     false
+    ]
+   },
+   "tp4": {
+    "p": 0,
+    "r": 0
+   }
+  },
+  {
+   "consts": {
+    "PDL": true,
+    "WORLD": 4
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: draft2d's Markov pick over the four nodes' bests (WORLD 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 1,
+   "phase": "tp4:draft_batch_capture:s1:markov odd step",
+   "rank": 0,
+   "scalars": {
+    "n_rows": 1,
+    "o_stride": 6
+   },
+   "tensors": {
+    "G": [
+     "float32",
+     [
+      4,
+      1,
+      4
+     ],
+     [
+      4,
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "int64",
+     [
+      1
+     ],
+     [
+      6
+     ],
+     true
+    ]
+   },
+   "tp4": {
+    "p": 0,
+    "r": 0
+   }
   }
  ],
  "_rope_heads": [
@@ -4419,6 +4673,298 @@
      ],
      [
       16384,
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "INV": false,
+    "PDL": true,
+    "RD": 64
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "X": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "INV": true,
+    "PDL": true,
+    "RD": 64
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "X": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "INV": false,
+    "PDL": true,
+    "RD": 64
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward:replay-cut odd first",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "X": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "INV": true,
+    "PDL": true,
+    "RD": 64
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward:replay-cut odd first",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "X": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
       512,
       1
      ],
@@ -6644,6 +7190,86 @@
    }
   }
  ],
+ "_sparse_attn_merge": [
+  {
+   "consts": {
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "PDL": true,
+    "SPLITS": 8
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "num_warps": 8,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "OUT": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ]
+   }
+  }
+ ],
  "_sparse_attn_merge_rot2": [
   {
    "consts": {
@@ -6918,6 +7544,2795 @@
      ],
      [
       4096,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "DISCARD": true,
+    "GH": 8,
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "PDL": true,
+    "RD": 64,
+    "SPLITS": 8,
+    "rows": 1
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    16,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:round:r1:b1024",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SUH": [
+     "float16",
+     [
+      8192
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "XH": [
+     "float16",
+     [
+      1,
+      2048
+     ],
+     [
+      2048,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "DISCARD": true,
+    "GH": 8,
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "PDL": true,
+    "RD": 64,
+    "SPLITS": 8
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    16,
+    16,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:round:r16:b1024",
+   "rank": 0,
+   "scalars": {
+    "rows": 16
+   },
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      16,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      1048576
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SUH": [
+     "float16",
+     [
+      8192
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "XH": [
+     "float16",
+     [
+      16,
+      2048
+     ],
+     [
+      2048,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "DISCARD": true,
+    "GH": 8,
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "PDL": true,
+    "RD": 64,
+    "SPLITS": 8,
+    "rows": 1
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    16,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:derived:window R=1",
+   "rank": 0,
+   "scalars": {},
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SUH": [
+     "float16",
+     [
+      8192
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "XH": [
+     "float16",
+     [
+      1,
+      2048
+     ],
+     [
+      2048,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "DISCARD": true,
+    "GH": 8,
+    "H": 16,
+    "HB": 16,
+    "HD": 512,
+    "PDL": true,
+    "RD": 64,
+    "SPLITS": 8
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    2,
+    16,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:derived:window R=2",
+   "rank": 0,
+   "scalars": {
+    "rows": 2
+   },
+   "tensors": {
+    "COS": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      2,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      2
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SIN": [
+     "float32",
+     [
+      1052672,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SUH": [
+     "float16",
+     [
+      8192
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "XH": [
+     "float16",
+     [
+      2,
+      2048
+     ],
+     [
+      2048,
+      1
+     ],
+     true
+    ]
+   }
+  }
+ ],
+ "_sparse_attn_part": [
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": false,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": false,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 4,
+    "PACKED": false,
+    "PDL": true,
+    "RING": true,
+    "SPLITS": 8,
+    "WIN": 128,
+    "WPF": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    8
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 0,
+    "ring_size": 144,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "bfloat16",
+     [
+      144,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "bfloat16",
+     [
+      144,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      144,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": false,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 5,
+    "PACKED": true,
+    "PDL": true,
+    "RING": true,
+    "SPLITS": 8,
+    "WIN": 128,
+    "WPF": true,
+    "n_idx": 1
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    1,
+    1,
+    8
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "ring_size": 144,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      1048576,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      1048576,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      1,
+      1
+     ],
+     [
+      1,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      65536
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      1,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      144,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": false,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 5,
+    "PACKED": true,
+    "PDL": true,
+    "RING": true,
+    "SPLITS": 8,
+    "WIN": 128,
+    "WPF": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    8,
+    1,
+    8
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 4,
+    "ring_size": 144,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      8
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      1024,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      1024,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      8,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      8,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      1024
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      1024
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      524288
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      8
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      8,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      8
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      144,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": false,
+    "H": 16,
+    "HAS_BASE": true,
+    "HAS_COMP": false,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 4,
+    "PACKED": false,
+    "PDL": true,
+    "RING": true,
+    "SPLITS": 8,
+    "WIN": 128,
+    "WPF": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    16,
+    1,
+    8
+   ],
+   "num_warps": 4,
+   "phase": "tp4:round:r16:b1024",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 0,
+    "ring_size": 144,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "bfloat16",
+     [
+      576,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "bfloat16",
+     [
+      576,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      16,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      1048576
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      16,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      576,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": false,
+    "H": 16,
+    "HAS_BASE": true,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 20,
+    "PACKED": true,
+    "PDL": true,
+    "RING": true,
+    "SPLITS": 8,
+    "WIN": 128,
+    "WPF": true
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    16,
+    1,
+    8
+   ],
+   "num_warps": 4,
+   "phase": "tp4:round:r16:b1024",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 512,
+    "ring_size": 144,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      524297,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      524297,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      16,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      16,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "float32",
+     [
+      2048
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "float32",
+     [
+      1048576
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      16,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      576,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": false,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 4,
+    "PACKED": false,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    17,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 0,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "bfloat16",
+     [
+      17,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "bfloat16",
+     [
+      17,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      17,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      17,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      17,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 12,
+    "PACKED": true,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    128,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 144,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "COMP": [
+     "uint8",
+     [
+      1048576,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      1048576,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      128,
+      144
+     ],
+     [
+      144,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      128,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      128,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      128,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      128,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      128,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      128
+     ],
+     [
+      1
+     ],
+     false
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      128,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 20,
+    "PACKED": true,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    514,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 272,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      514
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      524288,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      524288,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      514,
+      272
+     ],
+     [
+      272,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      514,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      514,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      514,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      514,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      514
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      514,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      514
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      514,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 5,
+    "PACKED": true,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    17,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 16,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      524288,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      524288,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      17,
+      16
+     ],
+     [
+      16,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      17,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      17,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      17,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      17
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      17,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 6,
+    "PACKED": true,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    33,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 48,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      33
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      1048576,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      1048576,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      33,
+      48
+     ],
+     [
+      48,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      33,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      33,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      33,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      33,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      33
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      33,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      33
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      33,
+      512
+     ],
+     [
+      512,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 32,
+    "FINAL": true,
+    "H": 16,
+    "HAS_BASE": false,
+    "HAS_COMP": true,
+    "HB": 16,
+    "HD": 512,
+    "NBLK": 8,
+    "PACKED": true,
+    "PDL": true,
+    "RING": false,
+    "SPLITS": 1,
+    "WIN": 128,
+    "WPF": false
+   },
+   "derived": {
+    "recorded_sha256": "205cc2c2df1376d48880c9ce7d664a1b2c7de61484fef85534175b27211eb50f",
+    "rule": "tp4: a 2D node's 16 heads (plan.headSpan at world 4)"
+   },
+   "grid": [
+    131,
+    1,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "tp4:forward",
+   "rank": 0,
+   "scalars": {
+    "n_idx": 80,
+    "ring_size": 16,
+    "scale": {
+     "float": 0.04419417382415922,
+     "fp32_bits": "0x3d3504f3",
+     "fp64_bits": "0x3fa6a09e667f3bcd"
+    }
+   },
+   "tensors": {
+    "CBASE": [
+     "int64",
+     [
+      131
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "COMP": [
+     "uint8",
+     [
+      524288,
+      256
+     ],
+     [
+      256,
+      1
+     ],
+     true
+    ],
+    "CSC": [
+     "uint8",
+     [
+      524288,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ],
+    "IDX": [
+     "int64",
+     [
+      131,
+      80
+     ],
+     [
+      80,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "bfloat16",
+     [
+      131,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "PL": [
+     "bfloat16",
+     [
+      131,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PM": [
+     "bfloat16",
+     [
+      131,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "PO": [
+     "bfloat16",
+     [
+      131,
+      32,
+      512
+     ],
+     [
+      16384,
+      512,
+      1
+     ],
+     true
+    ],
+    "POS": [
+     "int64",
+     [
+      131
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      131,
+      16,
+      512
+     ],
+     [
+      8192,
+      512,
+      1
+     ],
+     true
+    ],
+    "RBASE": [
+     "int64",
+     [
+      131
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "SINK": [
+     "float32",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WLO": [
+     "int64",
+     [
+      1
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "WSRC": [
+     "bfloat16",
+     [
+      131,
+      512
+     ],
+     [
+      512,
       1
      ],
      true

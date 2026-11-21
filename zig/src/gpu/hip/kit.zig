@@ -3,7 +3,7 @@
 //! resolves every kernel, and refuses to start when a kernel the configuration needs is missing. Kernels are then
 //! bound by id and specialization (typed: `Kernel(id, Params)`), never by name parsing. In strict mode (TF_GPU_STRICT,
 //! on unless set to 0) every launch is checked against its kernel's metadata and counted, and a launch of a kernel
-//! that is not in the manifest fails.
+//! that is not in the manifest fails. TF_GPU_COUNTS=1 counts the launches without strict mode's checks.
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -34,7 +34,7 @@ pub const Entry = struct {
     max_threads: u32,
 };
 
-/// The process's kit while strict checks are on (one kit a process).
+/// The process's kit while its launches are checked or counted (one kit a process).
 var active: ?*Kit = null;
 
 pub const Kit = struct {
@@ -48,6 +48,8 @@ pub const Kit = struct {
     entries: []Entry,
     by_handle: std.AutoHashMapUnmanaged(usize, u32) = .empty,
     counts: []std.atomic.Value(u64),
+    /// Counted launches of kernels the manifest does not list (TF_GPU_COUNTS=1; strict mode refuses them).
+    unlisted: std.atomic.Value(u64) = .init(0),
     strict: bool,
 
     /// Opens the kit in `dir` for a device of exactly `arch`, resolving every kernel `features` needs.
@@ -121,9 +123,9 @@ pub const Kit = struct {
         k.counts = try a.alloc(std.atomic.Value(u64), k.entries.len);
         for (k.counts) |*c| c.* = .init(0);
         try k.requireAll(dir, features);
-        if (k.strict) {
+        if (k.strict or countsFromEnv()) {
             active = k;
-            launch_mod.before = strictCheck;
+            launch_mod.before = if (k.strict) strictCheck else countOnly;
         }
         return k;
     }
@@ -172,11 +174,58 @@ pub const Kit = struct {
         return k.entries[i].f;
     }
 
-    /// Launches of each kernel id since open (strict mode or a profile).
+    /// Launches of entry `i` since open (strict mode or TF_GPU_COUNTS=1; zero otherwise).
     pub fn launches(k: *const Kit, i: u32) u64 {
         return k.counts[i].load(.monotonic);
     }
+
+    /// The counters copied into `at` (entries.len + 1 values: each entry's, then the unlisted launches').
+    pub fn mark(k: *const Kit, at: []u64) void {
+        for (k.counts, at[0..k.counts.len]) |*c, *x| x.* = c.load(.monotonic);
+        at[k.counts.len] = k.unlisted.load(.monotonic);
+    }
+
+    /// The launches since the mark `since` as a JSON object: the mode, the total, the launches of kernels outside the
+    /// manifest and each launched kernel id's count (its specializations summed). A graph replay launches nothing
+    /// here. Without room for the ids and `reserve` bytes after the object, it holds the totals alone.
+    pub fn launchesJson(k: *const Kit, since: []const u64, w: *std.Io.Writer, reserve: usize) !void {
+        const at = w.end;
+        if (k.launchesInto(since, w, true)) |_| {
+            if (w.buffer.len - w.end >= reserve) return;
+        } else |_| {}
+        w.end = at;
+        try k.launchesInto(since, w, false);
+    }
+
+    fn launchesInto(k: *const Kit, since: []const u64, w: *std.Io.Writer, ids: bool) !void {
+        const n = k.entries.len;
+        const unlisted = k.unlisted.load(.monotonic) - since[n];
+        var total = unlisted;
+        for (k.counts, since[0..n]) |*c, s| total += c.load(.monotonic) - s;
+        try w.print("{{\"mode\": \"{s}\", \"total\": {d}, \"unlisted\": {d}", .{ if (k.strict) "strict" else "count", total, unlisted });
+        if (ids) {
+            try w.writeAll(", \"by_kernel\": {");
+            var first = true;
+            for (k.entries, 0..) |e, i| {
+                var sum: u64 = 0;
+                for (k.entries, 0..) |o, j| if (std.mem.eql(u8, o.k.id, e.k.id)) {
+                    if (j < i) break; // an id is reported at its first entry
+                    sum += k.counts[j].load(.monotonic) - since[j];
+                };
+                if (sum == 0) continue;
+                try w.print("{s}\"{s}\": {d}", .{ if (first) "" else ", ", e.k.id, sum });
+                first = false;
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("}");
+    }
 };
+
+/// The kit whose launches are being counted (strict mode or TF_GPU_COUNTS=1), or null.
+pub fn counted() ?*const Kit {
+    return active;
+}
 
 fn isVision(id: []const u8) bool {
     return std.mem.startsWith(u8, id, "vision.");
@@ -207,6 +256,11 @@ test "a text configuration skips only the objects that hold nothing but vision k
 fn strictFromEnv() bool {
     const v = std.c.getenv("TF_GPU_STRICT") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+fn countsFromEnv() bool {
+    const v = std.c.getenv("TF_GPU_COUNTS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
 /// The manifest's record of a kernel must be what its object says (a kit edited or rebuilt by halves is refused).
@@ -256,6 +310,56 @@ fn strictCheck(f: Function, cfg: launch_mod.Config, args: *const launch_mod.Args
         return error.Invalid;
     }
     _ = k.counts[i].fetchAdd(1, .monotonic);
+}
+
+/// TF_GPU_COUNTS=1 without strict mode (launch.zig `before`): the launch is counted, nothing is checked or refused.
+fn countOnly(f: Function, _: launch_mod.Config, _: *const launch_mod.Args) @import("driver.zig").Error!void {
+    const k = active orelse return;
+    const c = if (k.by_handle.get(@intFromPtr(f.handle))) |i| &k.counts[i] else &k.unlisted;
+    _ = c.fetchAdd(1, .monotonic);
+}
+
+test "counted launches: each kernel id's count is the launches the hook saw; a mark makes them a request's" {
+    const gpa = std.testing.allocator;
+    const ids = [_][]const u8{ "glue.a", "tri.b", "tri.b", "glue.c" };
+    var entries: [ids.len]Entry = undefined;
+    var counts: [ids.len]std.atomic.Value(u64) = @splat(.init(0));
+    var kit: Kit = .{ .gpa = gpa, .arena = .init(gpa), .d = undefined, .m = undefined, .manifest_sha256 = undefined, .modules = &.{}, .entries = &entries, .counts = &counts, .strict = false };
+    defer kit.by_handle.deinit(gpa);
+    for (ids, &entries, 0..) |id, *e, i| {
+        const mk: manifest.Kernel = .{ .id = id, .symbol = id, .object = "t.hsaco", .args = &.{}, .kernarg_size = 0, .wave = 32, .max_flat_workgroup_size = 256, .lds_static = 0, .scratch = 0, .vgpr = 0, .sgpr = 0 };
+        e.* = .{ .k = mk, .f = .{ .d = undefined, .handle = @ptrFromInt(0x1000 + 16 * i) }, .explicit = &.{}, .max_threads = 256 };
+        try kit.by_handle.put(gpa, @intFromPtr(e.f.handle), @intCast(i));
+    }
+    active = &kit;
+    defer active = null;
+    const cfg: launch_mod.Config = .{ .grid = .{ .x = 4, .y = 1, .z = 1 }, .block = .{ .x = 64, .y = 1, .z = 1 } };
+    const args: launch_mod.Args = .{};
+    // count-only: 3, 2, 5 and 0 launches of the four entries, and one of a kernel the manifest does not list
+    for ([_]usize{ 3, 2, 5, 0 }, entries) |n, e| for (0..n) |_| try countOnly(e.f, cfg, &args);
+    try countOnly(.{ .d = undefined, .handle = @ptrFromInt(0x9000) }, cfg, &args);
+    try std.testing.expectEqual(@as(u64, 5), kit.launches(2));
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try kit.launchesJson(&@as([ids.len + 1]u64, @splat(0)), &w, 0);
+    try std.testing.expectEqualStrings("{\"mode\": \"count\", \"total\": 11, \"unlisted\": 1, \"by_kernel\": {\"glue.a\": 3, \"tri.b\": 7}}", w.buffered());
+    // a request: the counters at its start, then strict mode's check counting 2 launches that match the metadata
+    var at: [ids.len + 1]u64 = undefined;
+    kit.mark(&at);
+    kit.strict = true;
+    for (0..2) |_| try strictCheck(entries[3].f, cfg, &args);
+    w = .fixed(&buf);
+    try kit.launchesJson(&at, &w, 0);
+    const full = "{\"mode\": \"strict\", \"total\": 2, \"unlisted\": 0, \"by_kernel\": {\"glue.c\": 2}}";
+    try std.testing.expectEqualStrings(full, w.buffered());
+    // no room for the ids, or for the bytes the caller writes after the object: the totals alone
+    const short = "{\"mode\": \"strict\", \"total\": 2, \"unlisted\": 0}";
+    w = .fixed(buf[0 .. full.len - 1]);
+    try kit.launchesJson(&at, &w, 0);
+    try std.testing.expectEqualStrings(short, w.buffered());
+    w = .fixed(buf[0..full.len]);
+    try kit.launchesJson(&at, &w, 1);
+    try std.testing.expectEqualStrings(short, w.buffered());
 }
 
 /// A kernel bound by id and specialization, with its parameters declared as `P` (kernel.zig).

@@ -193,6 +193,11 @@ pub fn aux(kit: *const gpu.Kit, which: tri_aux.Which) !tri_aux.Aux {
     const p = params;
     return .{
         .attn = if (which.attn) (try gpu.Kernel("aux.sparse_attn", p.AuxAttn).bind(kit, &aux_specs.attn)).f else null,
+        // the 16-head build (TP4 ranks); a kit built before it leaves TP4 attention on Triton
+        .attn16 = if (which.attn and kit.find("aux.sparse_attn", &aux_specs.attn16) != null)
+            (try gpu.Kernel("aux.sparse_attn", p.AuxAttn).bind(kit, &aux_specs.attn16)).f
+        else
+            null,
         .index = if (which.index) (try gpu.Kernel("aux.index_rows", p.AuxIndex).bind(kit, &aux_specs.index)).f else null,
         .hc_mix = if (which.hc) (try gpu.Kernel("aux.hc_mix_pf", p.AuxHcMix).bind(kit, &aux_specs.hc)).f else null,
         .gate = if (which.gate) (try gpu.Kernel("aux.gate_logits", p.AuxGate).bind(kit, &aux_specs.gate)).f else null,
@@ -206,6 +211,7 @@ pub fn aux(kit: *const gpu.Kit, which: tri_aux.Which) !tri_aux.Aux {
 /// The aux kernels' registry specs.
 const aux_specs = struct {
     const attn = [_]gpu.kit.SpecItem{ .{ .key = "heads", .value = tri_aux.attn_heads }, .{ .key = "hd", .value = tri_aux.attn_hd } };
+    const attn16 = [_]gpu.kit.SpecItem{ .{ .key = "heads", .value = tri_aux.attn16_heads }, .{ .key = "hd", .value = tri_aux.attn_hd } };
     const index = [_]gpu.kit.SpecItem{ .{ .key = "heads", .value = tri_aux.index_heads }, .{ .key = "dim", .value = tri_aux.index_dim } };
     const hc = [_]gpu.kit.SpecItem{ .{ .key = "d", .value = tri_aux.hc_d }, .{ .key = "nb", .value = tri_aux.hc_nb } };
     const gate = [_]gpu.kit.SpecItem{ .{ .key = "d", .value = tri_aux.gate_d }, .{ .key = "bn", .value = tri_aux.gate_bn } };
@@ -219,7 +225,7 @@ test "the aux kernels' specs are registry.json's" {
     defer arena.deinit();
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), reg, .{});
     const want = [_]struct { []const u8, []const gpu.kit.SpecItem, i64 }{
-        .{ "aux.sparse_attn", &aux_specs.attn, 256 },  .{ "aux.index_rows", &aux_specs.index, 256 },    .{ "aux.hc_mix_pf", &aux_specs.hc, 256 },
+        .{ "aux.sparse_attn", &aux_specs.attn, 256 },  .{ "aux.sparse_attn", &aux_specs.attn16, 256 }, .{ "aux.index_rows", &aux_specs.index, 256 },    .{ "aux.hc_mix_pf", &aux_specs.hc, 256 },
         .{ "aux.gate_logits", &aux_specs.gate, 256 }, .{ "aux.gate_logits", &aux_specs.gate32, tri_aux.gate32_block }, .{ "aux.rope_heads", &aux_specs.rope, 256 },
         .{ "aux.markov_race", &aux_specs.rope, tri_aux.markov_race_block },
     };
@@ -287,6 +293,8 @@ const Coverage = struct {
         if (l.k2 > 16) return c.miss(0xff00 | l.k2, "EXL3 kernel for k2 {d} (above 16)", .{l.k2});
         const wk = exl3_linear.plan(l.k, if (l.plan_n != 0) l.plan_n else l.n).wk;
         if (c.lg.glinear[l.k2][cb][if (wk == 8) 1 else 0] == null) c.miss(0x1000 | l.k2 << 4 | wk, "exl3.glinear {{k2 {d}, cb {d}, warps {d}}}", .{ l.k2, cb, wk });
+        if (l.sk_fill == exl3_linear.sk_exact and c.lg.glinear_mlp[l.k2][if (wk == 8) 1 else 0] == null) c.miss(0x7000 | l.k2 << 4 | wk, "exl3.glinear_mlp {{k2 {d}, warps {d}}}", .{ l.k2, wk });
+        if (l.sk_fill == exl3_linear.sk_exact_lds and c.lg.glinear_mlp_lds[l.k2][if (wk == 8) 1 else 0] == null and c.lg.glinear_mlp[l.k2][if (wk == 8) 1 else 0] == null) c.miss(0x7100 | l.k2 << 4 | wk, "exl3.glinear_mlp_lds or exl3.glinear_mlp {{k2 {d}, warps {d}}}", .{ l.k2, wk });
         if (prompt and c.pf.unpack[l.k2][cb] == null) c.miss(0x2000 | l.k2, "exl3.unpack {{k2 {d}, cb {d}}}", .{ l.k2, cb });
     }
 
@@ -346,14 +354,28 @@ pub fn exl3Prefill(kit: *const gpu.Kit) !exl3_prefill.Kernels {
     return k;
 }
 
-/// The dense decode path: exl3.rot_many, and exl3.glinear by {k2, cb, warps 4 | 8}.
+/// The dense decode path: exl3.rot_many, exl3.glinear by {k2, cb, warps 4 | 8}, and (optional: an older kit omits
+/// them) exl3.glinear_mlp and exl3.glinear_mlp_lds by the same specialisation. coverage asks for a family only
+/// when sk_fill selects it. exact_lds accepts the register symbol when the LDS slot is empty.
 pub fn exl3Linear(kit: *const gpu.Kit) !exl3_linear.Kernels {
     var k: exl3_linear.Kernels = .{ .module = undefined, .rot_many = try bind(kit, "exl3.rot_many", params.Exl3RotMany), .kit_owned = true };
-    for (kit.entries, 0..) |*e, i| if (std.mem.eql(u8, e.k.id, "exl3.glinear")) {
-        const warps = try specValue(e, "warps", 8);
-        if (warps != 4 and warps != 8) return error.KitManifest;
-        k.glinear[try specValue(e, "k2", 16)][try specValue(e, "cb", 2)][if (warps == 8) 1 else 0] = try bindAt(kit, i, "exl3.glinear", params.Exl3GLinear);
-    };
+    for (kit.entries, 0..) |*e, i| {
+        if (std.mem.eql(u8, e.k.id, "exl3.glinear")) {
+            const warps = try specValue(e, "warps", 8);
+            if (warps != 4 and warps != 8) return error.KitManifest;
+            k.glinear[try specValue(e, "k2", 16)][try specValue(e, "cb", 2)][if (warps == 8) 1 else 0] = try bindAt(kit, i, "exl3.glinear", params.Exl3GLinear);
+        } else if (std.mem.eql(u8, e.k.id, "exl3.glinear_mlp")) {
+            const warps = try specValue(e, "warps", 8);
+            if (warps != 4 and warps != 8) return error.KitManifest;
+            if (try specValue(e, "cb", 2) != exl3_linear.codebook_mul1) continue;
+            k.glinear_mlp[try specValue(e, "k2", 16)][if (warps == 8) 1 else 0] = try bindAt(kit, i, "exl3.glinear_mlp", params.Exl3GLinear);
+        } else if (std.mem.eql(u8, e.k.id, "exl3.glinear_mlp_lds")) {
+            const warps = try specValue(e, "warps", 8);
+            if (warps != 4 and warps != 8) return error.KitManifest;
+            if (try specValue(e, "cb", 2) != exl3_linear.codebook_mul1) continue;
+            k.glinear_mlp_lds[try specValue(e, "k2", 16)][if (warps == 8) 1 else 0] = try bindAt(kit, i, "exl3.glinear_mlp_lds", params.Exl3GLinear);
+        }
+    }
     return k;
 }
 
@@ -387,6 +409,7 @@ pub fn exl3Experts(kit: *const gpu.Kit) !exl3_experts.Kernels {
             k.cp[r][epi - 1] = try bindAt(kit, i, "exl3.experts.grouped_cp", p.GroupedCp);
         }
     }
+    k.fallback();
     k.pf = try pfExperts(kit);
     return k;
 }
@@ -427,18 +450,25 @@ test "a 99.81 MHz wall clock is 10.019 ns a tick in 32.32" {
 
 /// The launches the packing tests saw, in order (a fake runtime accepts each one after launch.before records it).
 const seen = struct {
-    const Launch = struct { handle: usize, count: usize, offsets: [32]u16, sizes: [32]u16 };
+    const Launch = struct { handle: usize, count: usize, offsets: [32]u16, sizes: [32]u16, grid_x: u32 = 0, sk0: i32 = -1 };
     var launches: [16]Launch = undefined;
     var n: usize = 0;
 };
 
-fn record(f: gpu.Function, _: gpu.Config, args: *const gpu.Args) gpu.Error!void {
+fn record(f: gpu.Function, cfg: gpu.Config, args: *const gpu.Args) gpu.Error!void {
     const l = &seen.launches[seen.n];
     seen.n += 1;
     l.handle = @intFromPtr(f.handle);
     l.count = args.count;
     @memcpy(l.offsets[0..args.count], args.offsets[0..args.count]);
     @memcpy(l.sizes[0..args.count], args.sizes[0..args.count]);
+    l.grid_x = cfg.grid.x;
+    // layer 0's SK when the argument is GArgs (GLayer.SK at byte 100; the size assert locks the rest)
+    l.sk0 = -1;
+    if (args.count >= 1 and args.sizes[0] >= 104) {
+        const at: usize = args.offsets[0] + 100;
+        l.sk0 = std.mem.readInt(i32, args.storage[at..][0..4], .little);
+    }
 }
 
 fn accept(_: gpu.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: gpu.abi.Stream, _: gpu.abi.Params, _: gpu.abi.Params) callconv(.c) gpu.abi.Result {
@@ -626,6 +656,31 @@ test "every launcher packs exactly the parameter list its kernel is bound with" 
     });
 }
 
+test "the (8, 12) range: the kit's own kernels when it has them, else the generic (2, 16) ones" {
+    var n: usize = 0x1000;
+    var xk: exl3_experts.Kernels = .{
+        .base = undefined, .cb = undefined, .kit_owned = true, .group_count = fake(&n), .group_place = fake(&n), .work_list = fake(&n),
+        .rot_in = fake(&n), .gateup_epilogue = fake(&n), .down_combine = fake(&n), .decode_prep = fake(&n),
+    };
+    const g = exl3_experts.range(2, 16);
+    const r = exl3_experts.range(8, 12);
+    xk.mma[g] = fake(&n);
+    xk.rows[g] = fake(&n);
+    xk.cp[g] = .{ fake(&n), fake(&n) };
+    var own = xk;
+    own.mma[r] = fake(&n);
+    own.cp[r][1] = fake(&n);
+    xk.fallback();
+    try std.testing.expectEqual(xk.mma[g].?.handle, xk.mma[r].?.handle);
+    try std.testing.expectEqual(xk.rows[g].?.handle, xk.rows[r].?.handle);
+    for (xk.cp[g], xk.cp[r]) |a, b| try std.testing.expectEqual(a.?.handle, b.?.handle);
+    own.fallback();
+    try std.testing.expect(own.mma[r].?.handle != own.mma[g].?.handle);
+    try std.testing.expectEqual(own.rows[g].?.handle, own.rows[r].?.handle);
+    try std.testing.expectEqual(own.cp[g][0].?.handle, own.cp[r][0].?.handle);
+    try std.testing.expect(own.cp[r][1].?.handle != own.cp[g][1].?.handle);
+}
+
 test "coverage names each missing specialization the weights reach, once" {
     const cb = exl3_linear.codebook_mul1;
     var n: usize = 0x1000;
@@ -676,4 +731,153 @@ test "coverage names each missing specialization the weights reach, once" {
     w.dspark = .{ .blocks = &blocks, .main_proj = lin(8), .main_norm = 0, .norm = 0, .markov_embed = 0, .markov_head = 0, .conf = 0 };
     lg.glinear[6][cb] = .{ fake(&n), fake(&n) };
     try coverage(&w, &pf, &lg, &xk);
+    // exact asks for glinear_mlp. Absent, one miss. Present, the open stands. sk_fill 0 above did not ask.
+    layers[0].wo_b.sk_fill = exl3_linear.sk_exact;
+    c = scan(&w, &pf, &lg, &xk, false);
+    try std.testing.expectEqual(@as(usize, 1), c.missing);
+    lg.glinear_mlp[8][0] = fake(&n); // wo_b k2 8, wk 4
+    try coverage(&w, &pf, &lg, &xk);
+    // exact_lds with only the register symbol stands (that slot is the fallback). Both empty: one miss.
+    // The LDS symbol alone also stands.
+    layers[0].wo_b.sk_fill = exl3_linear.sk_exact_lds;
+    try coverage(&w, &pf, &lg, &xk);
+    lg.glinear_mlp[8][0] = null;
+    c = scan(&w, &pf, &lg, &xk, false);
+    try std.testing.expectEqual(@as(usize, 1), c.missing);
+    lg.glinear_mlp_lds[8][0] = fake(&n);
+    try coverage(&w, &pf, &lg, &xk);
+}
+
+test "TF_DS_TP4_FILL=exact launches glinear_mlp at TP2's grid, and only at 1..16 rows" {
+    const saved = gpu.launch.before;
+    defer gpu.launch.before = saved;
+    gpu.launch.before = record;
+    defer seen.n = 0;
+    fake_driver.api.hipModuleLaunchKernel = accept;
+    try std.testing.expectEqual(@as(usize, 100), @offsetOf(exl3_linear.GLayer, "SK"));
+    var n: usize = 0x1000;
+    const s: gpu.Stream = .{ .d = &fake_driver, .handle = @ptrFromInt(0x20) };
+    var lg: exl3_linear.Kernels = .{ .module = undefined, .rot_many = fake(&n), .kit_owned = true };
+    const cb = exl3_linear.codebook_mul1;
+    for (&lg.glinear[8][cb]) |*g| g.* = fake(&n);
+    for (&lg.glinear_mlp[8]) |*g| g.* = fake(&n);
+    const p = params;
+    const woa = struct {
+        fn call(fill: u8) exl3_linear.Call {
+            return .{
+                .layer = .{ .words = 1, .suh = 1, .svh = 1, .k = 4096, .n = 1024, .k2 = 8, .sk_fill = fill },
+                .x = 1,
+                .ldx = 4096,
+                .x_dtype = .bf16,
+                .xh = 2,
+                .y = 3,
+                .ldy = 1024,
+                .y_dtype = .bf16,
+                .counters = 4,
+            };
+        }
+    };
+    // two wo_a groups, exact: one mlp launch, 128 blocks, SK 8
+    const a = woa.call(exl3_linear.sk_exact);
+    try exl3_linear.glinear(&lg, s, &.{ a, woa.call(exl3_linear.sk_exact) }, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 1), seen.n);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear_mlp[8][0].?);
+    try std.testing.expectEqual(@as(u32, 128), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    // m 17 stays on glinear. one group, 64 blocks, same SK
+    try exl3_linear.glinear(&lg, s, &.{a}, 17, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 1), seen.n);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear[8][cb][0].?);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    // default off: glinear, today's grid
+    const off = woa.call(0);
+    try exl3_linear.glinear(&lg, s, &.{off}, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 1), seen.n);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear[8][cb][0].?);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    // =1 still uses glinear, and the grid grows (one group, sk 16, 128 blocks)
+    try exl3_linear.glinear(&lg, s, &.{woa.call(exl3_linear.sk_splits)}, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 1), seen.n);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear[8][cb][0].?);
+    try std.testing.expectEqual(@as(u32, 128), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 16), seen.launches[0].sk0);
+    seen.n = 0;
+    // exact does not share a launch with a normal linear of the same k2 and wk
+    try exl3_linear.glinear(&lg, s, &.{ a, off }, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 2), seen.n);
+    try std.testing.expectEqual(@intFromPtr(lg.glinear_mlp[8][0].?.handle), seen.launches[0].handle);
+    try std.testing.expectEqual(@intFromPtr(lg.glinear[8][cb][0].?.handle), seen.launches[1].handle);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[1].grid_x);
+    seen.n = 0;
+    // wo_b exact: 160 blocks, SK 8, wk 4. wq_b exact: 64 blocks, SK 1, wk 8.
+    const wob: exl3_linear.Call = .{
+        .layer = .{ .words = 1, .suh = 1, .svh = 1, .k = 4096, .n = 2560, .k2 = 8, .plan_n = 5120, .sk_fill = exl3_linear.sk_exact },
+        .x = 1,
+        .ldx = 4096,
+        .x_dtype = .bf16,
+        .xh = 2,
+        .y = 3,
+        .ldy = 2560,
+        .y_dtype = .bf16,
+        .counters = 4,
+    };
+    try exl3_linear.glinear(&lg, s, &.{wob}, 4, 0x5000, false, false);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear_mlp[8][0].?);
+    try std.testing.expectEqual(@as(u32, 160), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    const wqb: exl3_linear.Call = .{
+        .layer = .{ .words = 1, .suh = 1, .svh = 1, .k = 1280, .n = 8192, .k2 = 8, .plan_n = 16384, .sk_fill = exl3_linear.sk_exact },
+        .x = 1,
+        .ldx = 1280,
+        .x_dtype = .bf16,
+        .xh = 2,
+        .y = 3,
+        .ldy = 8192,
+        .y_dtype = .bf16,
+        .counters = 4,
+    };
+    try exl3_linear.glinear(&lg, s, &.{wqb}, 6, 0x5000, false, false);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear_mlp[8][1].?);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 1), seen.launches[0].sk0);
+    seen.n = 0;
+    // exact_lds: the same grids and SK, the LDS family. It does not share a launch with exact.
+    for (&lg.glinear_mlp_lds[8]) |*g| g.* = fake(&n);
+    const al = woa.call(exl3_linear.sk_exact_lds);
+    try exl3_linear.glinear(&lg, s, &.{ al, woa.call(exl3_linear.sk_exact_lds) }, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 1), seen.n);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear_mlp_lds[8][0].?);
+    try std.testing.expectEqual(@as(u32, 128), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    try exl3_linear.glinear(&lg, s, &.{ a, al }, 4, 0x5000, false, false);
+    try std.testing.expectEqual(@as(usize, 2), seen.n);
+    try std.testing.expectEqual(@intFromPtr(lg.glinear_mlp[8][0].?.handle), seen.launches[0].handle);
+    try std.testing.expectEqual(@intFromPtr(lg.glinear_mlp_lds[8][0].?.handle), seen.launches[1].handle);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[1].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[1].sk0);
+    seen.n = 0;
+    // m 17 stays on glinear
+    try exl3_linear.glinear(&lg, s, &.{al}, 17, 0x5000, false, false);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear[8][cb][0].?);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    seen.n = 0;
+    // no LDS symbol: the register kernel, same grid
+    lg.glinear_mlp_lds[8][0] = null;
+    try exl3_linear.glinear(&lg, s, &.{al}, 4, 0x5000, false, false);
+    try expectLaunch(0, p.Exl3GLinear, lg.glinear_mlp[8][0].?);
+    try std.testing.expectEqual(@as(u32, 64), seen.launches[0].grid_x);
+    try std.testing.expectEqual(@as(i32, 8), seen.launches[0].sk0);
+    seen.n = 0;
+    lg.glinear_mlp[8][0] = null;
+    try std.testing.expectError(error.MissingKernel, exl3_linear.glinear(&lg, s, &.{al}, 4, 0x5000, false, false));
 }

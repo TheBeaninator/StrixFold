@@ -1858,7 +1858,8 @@ __device__ __forceinline__ void grouped_cp_body(const __half* X0, const __half* 
     }
 TF_DS_EXL3_GROUPED(8, 8)
 TF_DS_EXL3_GROUPED(2, 10)
-TF_DS_EXL3_GROUPED(2, 16)   // the MTP blocks' sets: routed K2 8 with the K2 12 shared expert
+TF_DS_EXL3_GROUPED(2, 16)   // any K2 set of 2..16 (exl3_experts.range()'s generic template)
+TF_DS_EXL3_GROUPED(8, 12)   // routed K2 8 with the K2 12 shared expert: the 4.0 bpw layers and the MTP blocks' sets
 #undef TF_DS_EXL3_GROUPED
 #undef TF_DS_EXL3_GROUPED_ARGS
 

@@ -164,6 +164,34 @@ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: us
     return kc;
 }
 
+/// TF_FUSE2=1 (read by Round.init, every rank alike; default off): a decode window's rowmm_gate and route as ONE
+/// launch, _rowmm_route (tools/dsv41-hip/exl3/kdec/fuse2/route_fuse.py: _rowmm_parts' code, then _route_parts' code
+/// for the window's rows by the launch's last program to arrive, counter cnt[0]; the same bits), for windows of up to
+/// fuse2_rows rows. Needs the arrival counter and the kit's _rowmm_route, else the two launches as recorded.
+pub var fuse2 = false;
+
+/// The most rows gateRoute fuses: the last program routes the rows one after another, so at many rows the two
+/// launches (a route program a row) are faster. On one box, host-launched, us a site fused against the two: 1 row
+/// 21.8 / 28.3, 2 rows 22.5 / 30.1, 4 rows 23.7 / 31.4, 6 rows 26.9 / 32.0, 16 rows 112.4 / 40.9; 7-15 rows not
+/// measured.
+pub var fuse2_rows: usize = 6;
+
+/// rowmm_gate then route of a decode window (Model.moe): the gate's chunk sums into `gl`, then picks and weights. One
+/// launch under TF_FUSE2 (cnt: an int32 arrival counter, zero; the launch leaves it zero), else rowmmGate and route.
+pub fn gateRoute(t: Tri, x: u64, xs: usize, w: u64, gl: u64, cnt: u64, bias: u64, topk: usize, scale: f32, shared_id: usize, pick: u64, wts: u64, rows: usize, k: usize, n: usize, slots: usize) !void {
+    const kc = gateParts(rows, k, n);
+    if (!fuse2 or cnt == 0 or kc == 0 or rows > fuse2_rows) {
+        const got = try rowmmGate(t, x, xs, w, gl, rows, k, n);
+        return route(t, gl, got, bias, topk, scale, shared_id, pick, wts, rows, n, slots);
+    }
+    const tile = rpTile(rows);
+    try t.run("_rowmm_route", .{ tri.cdiv(n, tile.bn), u(kc / tile.cpg), 1 }, &.{
+        p("X", "*bf16", x),       aot.int("xs", @intCast(xs)), p("W", "*fp16", w),         p("S", "*fp32", gl),
+        p("CNT", "*i32", cnt),    p("BIAS", "*fp32", bias),    p("PICK", "*i32", pick),    p("WTS", "*fp32", wts),
+        aot.float("scale", scale), aot.int("shared_id", @intCast(shared_id)),
+    }, &.{ ci("K", k), ci("N", n), ci("BN", tile.bn), ci("BK", 256), ci("CPG", tile.cpg), ci("RB", rows), ci("NB", tri.pow2(n)), ci("TOPK", topk), ci("SLOTS", slots), ci("SP", tri.pow2(slots)) });
+}
+
 /// route: picks [R, SLOTS] i32 and weights [R, SLOTS] fp32 (shared expert last) from logits [R, NE] (kc 0) or chunk sums [R, kc, NE].
 pub fn route(t: Tri, logits: u64, kc: usize, bias: u64, topk: usize, scale: f32, shared_id: usize, pick: u64, wts: u64, rows: usize, ne: usize, slots: usize) !void {
     if (kc > 0) return t.run("_route_parts", .{ u(rows), 1, 1 }, &.{
@@ -357,4 +385,82 @@ test "route (logits) launches _route as recorded" {
 
 test "route (rowmm_gate's chunk sums) launches _route_parts as recorded" {
     try tri.conform("_route_parts", callRoute);
+}
+
+/// A logged launch's pointer argument `name`.
+fn loggedPtr(k: tri.Log.Kept, name: []const u8) !u64 {
+    for (k.args) |a| if (std.mem.eql(u8, a.name, name)) return a.value.ptr.addr;
+    return error.TestUnexpectedResult;
+}
+
+/// A logged launch's int constexpr `name`.
+fn loggedConst(k: tri.Log.Kept, name: []const u8) !i64 {
+    for (k.consts) |c| if (std.mem.eql(u8, c.name, name)) return c.int orelse error.TestUnexpectedResult;
+    return error.TestUnexpectedResult;
+}
+
+test "TF_FUSE2: rowmm_gate and route as one launch on the two launches' grid, constexprs and wires; else the two as recorded" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    const saved_rows = fuse2_rows;
+    defer fuse2 = false;
+    defer fuse2_rows = saved_rows;
+    const x = 0x1000;
+    const w = 0x2000;
+    const gl = 0x3000;
+    const cnt = 0x4000;
+    const bias = 0x5000;
+    const pick = 0x6000;
+    const wts = 0x7000;
+    // the cap as shipped is 6 rows: a 6-row window is the one launch, a 7-row window the two, though the switch is on
+    try std.testing.expectEqual(@as(usize, 6), fuse2_rows);
+    fuse2 = true;
+    try gateRoute(t, x, 5120, w, gl, cnt, bias, 6, 1.5, 384, pick, wts, 6, 5120, 384, 7);
+    try gateRoute(t, x, 5120, w, gl, cnt, bias, 6, 1.5, 384, pick, wts, 7, 5120, 384, 7);
+    try std.testing.expectEqual(@as(usize, 3), log.items.items.len);
+    for ([_][]const u8{ "_rowmm_route", "_rowmm_parts", "_route_parts" }, log.items.items) |n, k| try std.testing.expectEqualStrings(n, k.name);
+    log.deinit();
+    log.items = .empty;
+    // the main model's router (K 5120, 384 experts, top 6 of 7 slots, the shared expert's id 384) at every window size
+    for (1..decode_rows + 1) |rows| {
+        // the two launches, the switch off
+        fuse2 = false;
+        try gateRoute(t, x, 5120, w, gl, cnt, bias, 6, 1.5, 384, pick, wts, rows, 5120, 384, 7);
+        try std.testing.expectEqual(@as(usize, 2), log.items.items.len);
+        const parts = log.items.items[0];
+        const rt = log.items.items[1];
+        try std.testing.expectEqualStrings("_rowmm_parts", parts.name);
+        try std.testing.expectEqualStrings("_route_parts", rt.name);
+        // the one launch: _rowmm_parts' grid and constexprs, _route_parts' constexprs, both launches' wires
+        fuse2 = true;
+        fuse2_rows = decode_rows;
+        try gateRoute(t, x, 5120, w, gl, cnt, bias, 6, 1.5, 384, pick, wts, rows, 5120, 384, 7);
+        try std.testing.expectEqual(@as(usize, 3), log.items.items.len);
+        const f = log.items.items[2];
+        try std.testing.expectEqualStrings("_rowmm_route", f.name);
+        try std.testing.expectEqual(parts.grid, f.grid);
+        for ([_][]const u8{ "K", "N", "BN", "BK", "CPG", "RB" }) |c| try std.testing.expectEqual(try loggedConst(parts, c), try loggedConst(f, c));
+        for ([_][]const u8{ "NB", "TOPK", "SLOTS", "SP" }) |c| try std.testing.expectEqual(try loggedConst(rt, c), try loggedConst(f, c));
+        try std.testing.expectEqual(try loggedConst(rt, "NE"), try loggedConst(f, "N"));
+        try std.testing.expectEqual(try loggedConst(rt, "KC") * try loggedConst(f, "BK"), try loggedConst(f, "K"));
+        // every program of the grid arrives once: the counter's last value is grid x * grid y - 1
+        try std.testing.expectEqual(@as(u32, 1), f.grid[2]);
+        for ([_][]const u8{ "X", "W", "S" }) |a| try std.testing.expectEqual(try loggedPtr(parts, a), try loggedPtr(f, a));
+        for ([_][]const u8{ "S", "BIAS", "PICK", "WTS" }) |a| try std.testing.expectEqual(try loggedPtr(rt, a), try loggedPtr(f, a));
+        try std.testing.expectEqual(@as(u64, cnt), try loggedPtr(f, "CNT"));
+        try std.testing.expectEqual(parts.args.len + rt.args.len - 1, f.args.len); // S once, no rows, the counter
+        // past fuse2_rows, or without the counter: the two launches again
+        fuse2_rows = rows - 1;
+        try gateRoute(t, x, 5120, w, gl, cnt, bias, 6, 1.5, 384, pick, wts, rows, 5120, 384, 7);
+        fuse2_rows = decode_rows;
+        try gateRoute(t, x, 5120, w, gl, 0, bias, 6, 1.5, 384, pick, wts, rows, 5120, 384, 7);
+        try std.testing.expectEqual(@as(usize, 7), log.items.items.len);
+        for ([_]usize{ 3, 5 }) |i| {
+            try std.testing.expectEqualStrings("_rowmm_parts", log.items.items[i].name);
+            try std.testing.expectEqualStrings("_route_parts", log.items.items[i + 1].name);
+        }
+        log.deinit();
+        log.items = .empty;
+    }
 }

@@ -159,7 +159,8 @@ fn expectRecorded(ls: []const xe.DecodeLaunch, rec: []const u8, r: usize) !void 
         try std.testing.expectEqual(dims(v.get("grid").?), [3]u32{ l.cfg.grid.x, l.cfg.grid.y, l.cfg.grid.z });
         try std.testing.expectEqual(dims(v.get("block").?), [3]u32{ l.cfg.block.x, l.cfg.block.y, l.cfg.block.z });
         try std.testing.expectEqual(v.get("smem").?.integer, l.cfg.shared);
-        try std.testing.expectEqual(v.get("pdl").?.integer != 0, l.cfg.pdl);
+        // PDL is CUDA's (gpu.features.pdl): a HIP build launches the recorded kernel, grid and parameters without it
+        try std.testing.expectEqual(v.get("pdl").?.integer != 0 and gpu.features.pdl, l.cfg.pdl);
         var buf: [2048]u8 = undefined;
         try std.testing.expectEqualStrings(v.get("params").?.string, try masked(&l.args, &buf));
     }

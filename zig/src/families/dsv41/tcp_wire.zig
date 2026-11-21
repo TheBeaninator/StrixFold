@@ -56,6 +56,14 @@ pub const Options = struct {
     stripe_min: usize = 4 << 20,
     /// connect retries for this long while the peer starts listening
     connect_ns: u64 = 300 * std.time.ns_per_s,
+    /// threads that move a striped exchange (TF_COLL_WIRE_THREADS): 1, the calling thread moves every link's part in
+    /// turn; 2, a helper thread (Helper) moves the second link's part while the caller moves the first, so each link's
+    /// copies and its socket's work have a core. This rank's own: the bytes on each link are the same either way, so
+    /// the peer may run with the other value.
+    threads: u8 = 1,
+    /// how long the helper thread spins for its next part before it sleeps (a prompt chunk's gathers follow one
+    /// another within a layer step, about 20 ms; a sleeping helper costs one wake)
+    helper_spin_ns: u64 = 20 * std.time.ns_per_ms,
 };
 
 const State = enum(u32) { ok = 0, peer_lost, timeout, mismatch, aborted, socket_failed, closed };
@@ -99,6 +107,12 @@ pub const Wire = struct {
     busy: std.atomic.Value(u32) = .init(0),
     /// the first failure's description, for the log
     why: [96]u8 = @splat(0),
+    /// when a byte last moved on any link, in either direction (the progress deadline's clock; the caller's and the
+    /// helper's loops both write it)
+    moved_at: std.atomic.Value(u64) = .init(0),
+    /// the second link's thread (opt.threads = 2), started by the first striped exchange: the Wire is at its final
+    /// address by then (open returns it by value)
+    helper: ?*Helper = null,
 
     /// Rank 0: listen on each address (one per link, its USB4 address), take one connection on each, and check its
     /// hello (magic, version, rank, epoch, link index). Rank 1: connect to each, retrying while rank 0 starts.
@@ -173,7 +187,15 @@ pub const Wire = struct {
         }
         const t0 = monotonicNs();
         while (w.busy.load(.acquire) != 0 and monotonicNs() - t0 < ns) std.atomic.spinLoopHint();
-        if (w.busy.load(.acquire) == 0) w.closeFds();
+        const idle = w.busy.load(.acquire) == 0;
+        if (idle) w.closeFds();
+        // the helper leaves its part at once (the state is no longer ok) and then its loop; a call still in flight
+        // may yet read the helper's words, so they are freed only when none is
+        if (w.helper) |h| {
+            h.stopAndJoin();
+            if (idle) h.free();
+            w.helper = null;
+        }
     }
 
     /// Sends `out` and receives the peer's equally long payload into `in`, both at once. The payload is split over the
@@ -197,7 +219,28 @@ pub const Wire = struct {
                 .in = in[lo..hi],
             };
         }
+        if (parts > 1 and w.opt.threads > 1) return w.runBoth(io[0..parts]);
         return w.run(io[0..parts]);
+    }
+
+    /// A striped exchange on two threads: the helper moves the second link's part, the caller the first, and the call
+    /// returns when both have ended. Either thread's failure poisons the wire, which the other's loop sees at its next
+    /// turn, so both always end; the call returns the wire's first failure. Without a helper (its thread could not
+    /// start) the caller moves both parts as with opt.threads = 1.
+    fn runBoth(w: *Wire, parts: []Part) Error!void {
+        const h = w.helper orelse blk: {
+            const made = Helper.start(w.opt.helper_spin_ns) catch |e| {
+                std.log.warn("tcp_wire: rank {d}: no helper thread ({s}); striped exchanges stay on the calling thread", .{ w.rank, @errorName(e) });
+                w.opt.threads = 1;
+                return w.run(parts);
+            };
+            w.helper = made;
+            break :blk made;
+        };
+        const job = h.post(w, parts[1..]);
+        w.run(parts[0..1]) catch {}; // (its failure is the wire's state, read below)
+        h.wait(job);
+        if (w.status()) |e| return e;
     }
 
     fn failed(w: *Wire, e: Error, why: []const u8) Error {
@@ -221,7 +264,7 @@ pub const Wire = struct {
     };
 
     fn run(w: *Wire, parts: []Part) Error!void {
-        var last = monotonicNs();
+        w.moved_at.store(monotonicNs(), .release);
         var idle: u32 = 0;
         while (true) {
             var moved = false;
@@ -257,11 +300,11 @@ pub const Wire = struct {
             if (w.state.load(.monotonic) != 0) return w.status().?;
             if (moved) {
                 idle = 0;
-                last = monotonicNs();
+                w.moved_at.store(monotonicNs(), .release);
                 continue;
             }
             idle +%= 1;
-            if (idle % 1024 == 0 and monotonicNs() - last > w.opt.progress_ns)
+            if (idle % 1024 == 0 and monotonicNs() -| w.moved_at.load(.acquire) > w.opt.progress_ns)
                 return w.failed(error.Timeout, "no progress within the deadline");
         }
     }
@@ -284,6 +327,93 @@ pub const Wire = struct {
         return h.magic == magic and h.version == version and std.mem.eql(u8, &h.epoch, &w.epoch) and h.seq == m.seq and
             h.bytes == m.bytes and h.site == m.site and h.rank == 1 - w.rank and h.part == m.part and h.parts == m.parts and
             h.flags == 0;
+    }
+};
+
+/// The second link's thread of a Wire with opt.threads = 2. It takes one job at a time from the Wire's caller (a
+/// striped exchange's parts past the first), runs Wire.run on it and says so; between jobs it spins for spin_ns and
+/// then sleeps in a receive on its wake socket, which a post or a stop ends with one byte.
+const Helper = struct {
+    thread: std.Thread = undefined,
+    /// a socket pair: the helper sleeps in a receive on [0], post and stop write a byte to [1]
+    wake: [2]c.fd_t,
+    spin_ns: u64,
+    /// the job: written by post before `posted` moves, read by the helper after it
+    w: *Wire = undefined,
+    parts: []Wire.Part = &.{},
+    posted: std.atomic.Value(u32) = .init(0),
+    done: std.atomic.Value(u32) = .init(0),
+    asleep: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn start(spin_ns: u64) !*Helper {
+        const h = try std.heap.page_allocator.create(Helper);
+        errdefer std.heap.page_allocator.destroy(h);
+        var sv: [2]c.fd_t = undefined;
+        if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &sv) != 0) return error.SocketFailed;
+        errdefer for (sv) |fd| {
+            _ = c.close(fd);
+        };
+        h.* = .{ .wake = sv, .spin_ns = spin_ns };
+        h.thread = try std.Thread.spawn(.{}, loop, .{h});
+        return h;
+    }
+
+    /// Hands the helper `parts` of `w`'s exchange; the number to wait for.
+    fn post(h: *Helper, w: *Wire, parts: []Wire.Part) u32 {
+        h.w = w;
+        h.parts = parts;
+        const job = h.posted.fetchAdd(1, .seq_cst) +% 1;
+        if (h.asleep.load(.seq_cst) != 0) h.poke();
+        return job;
+    }
+
+    /// Until the helper has ended job `job` (its loop ends on the wire's state, a progress deadline or the part's end).
+    fn wait(h: *Helper, job: u32) void {
+        while (h.done.load(.acquire) != job) std.atomic.spinLoopHint();
+    }
+
+    fn poke(h: *Helper) void {
+        const b = [1]u8{1};
+        _ = c.send(h.wake[1], &b, 1, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
+    }
+
+    fn stopAndJoin(h: *Helper) void {
+        h.stop.store(1, .seq_cst);
+        h.poke();
+        h.thread.join();
+    }
+
+    fn free(h: *Helper) void {
+        for (h.wake) |fd| _ = c.close(fd);
+        std.heap.page_allocator.destroy(h);
+    }
+
+    fn loop(h: *Helper) void {
+        var seen: u32 = 0;
+        while (true) {
+            var t0 = monotonicNs();
+            var spins: u32 = 0;
+            while (h.posted.load(.acquire) == seen) {
+                if (h.stop.load(.acquire) != 0) return;
+                spins +%= 1;
+                if (spins % 256 == 0 and monotonicNs() -| t0 >= h.spin_ns) {
+                    // asleep is set before the last look at posted and stop, and post and stop look at asleep after
+                    // they wrote theirs: one of the two always sees the other, so no wake is lost
+                    h.asleep.store(1, .seq_cst);
+                    if (h.posted.load(.seq_cst) == seen and h.stop.load(.seq_cst) == 0) {
+                        var b: [8]u8 = undefined;
+                        _ = c.recv(h.wake[0], &b, b.len, 0);
+                    }
+                    h.asleep.store(0, .seq_cst);
+                    t0 = monotonicNs();
+                }
+                std.atomic.spinLoopHint();
+            }
+            seen +%= 1;
+            h.w.run(h.parts) catch {}; // (its failure is the wire's state, which the caller returns)
+            h.done.store(seen, .release);
+        }
     }
 };
 
@@ -554,4 +684,265 @@ test "a peer from another session is refused" {
     t.join();
     try testing.expectEqual(@as(?Error, error.Mismatch), p0.result);
     try testing.expectEqual(@as(?Error, error.Mismatch), p1.result);
+}
+
+/// One rank of the threaded-exchange tests: each exchange's received bytes are checked against what the peer sent and
+/// folded, in order, into a SHA-256, so two runs of the same list can be compared byte for byte.
+const SumPeer = struct {
+    w: *Wire,
+    sizes: []const usize,
+    result: ?Error = null,
+    bad: usize = 0,
+    digest: [32]u8 = @splat(0),
+
+    fn run(p: *SumPeer) void {
+        const a = std.heap.page_allocator;
+        var max: usize = 1;
+        for (p.sizes) |n| max = @max(max, n);
+        const out = a.alloc(u8, max) catch return;
+        defer a.free(out);
+        const in = a.alloc(u8, max) catch return;
+        defer a.free(in);
+        const want = a.alloc(u8, max) catch return;
+        defer a.free(want);
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        for (p.sizes, 0..) |n, k| {
+            fill(out[0..n], k * 2 + p.w.rank);
+            @memset(in[0..n], 0xA5);
+            p.w.exchange(@intCast(k + 1), out[0..n], in[0..n]) catch |e| {
+                p.result = e;
+                return;
+            };
+            fill(want[0..n], k * 2 + (1 - p.w.rank));
+            if (!std.mem.eql(u8, want[0..n], in[0..n])) p.bad += 1;
+            sha.update(in[0..n]);
+        }
+        sha.final(&p.digest);
+    }
+};
+
+fn threadedOpt(threads: u8, spin_ns: u64, stripe_min: usize) Options {
+    return .{ .busy_poll_us = 0, .rto_min_us = 0, .progress_ns = 300 * std.time.ns_per_ms, .stripe_min = stripe_min, .threads = threads, .helper_spin_ns = spin_ns };
+}
+
+/// The same exchange list on two links with rank 0 on t0 threads and rank 1 on t1: each rank's digest of what it received.
+fn runSums(t0: u8, t1: u8, spin_ns: u64, sizes: []const usize) ![2][32]u8 {
+    const fds = try pairs(2);
+    var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, threadedOpt(t0, spin_ns, 1 << 20));
+    var w1 = Wire.fromFds(1, fds[1][0..2], test_epoch, threadedOpt(t1, spin_ns, 1 << 20));
+    defer w0.close(std.time.ns_per_s);
+    defer w1.close(std.time.ns_per_s);
+    var p0: SumPeer = .{ .w = &w0, .sizes = sizes };
+    var p1: SumPeer = .{ .w = &w1, .sizes = sizes };
+    const t = try std.Thread.spawn(.{}, SumPeer.run, .{&p1});
+    p0.run();
+    t.join();
+    try testing.expectEqual(@as(?Error, null), p0.result);
+    try testing.expectEqual(@as(?Error, null), p1.result);
+    try testing.expectEqual(@as(usize, 0), p0.bad + p1.bad);
+    // the helper exists exactly where it was asked for and a striped payload came by
+    try testing.expectEqual(t0 > 1, w0.helper != null);
+    try testing.expectEqual(t1 > 1, w1.helper != null);
+    return .{ p0.digest, p1.digest };
+}
+
+test "two threads move a striped exchange byte for byte as one does, on either rank or both" {
+    // below the stripe size (one part, the caller's), at it, odd sizes whose halves differ, and empty
+    const sizes = [_]usize{ 0, 40, 122880, 1 << 20, (1 << 20) + 1, 3 << 20, (2 << 20) + 7, 7, 4 << 20, (1 << 20) - 1 };
+    const one = try runSums(1, 1, 0, &sizes);
+    // (a helper that sleeps between its parts, and one that spins through them)
+    for ([_]u64{ 0, 20 * std.time.ns_per_ms }) |spin| {
+        for ([_][2]u8{ .{ 2, 2 }, .{ 2, 1 }, .{ 1, 2 } }) |t| {
+            const got = try runSums(t[0], t[1], spin, &sizes);
+            try testing.expectEqualSlices(u8, &one[0], &got[0]);
+            try testing.expectEqualSlices(u8, &one[1], &got[1]);
+        }
+    }
+}
+
+/// A gather as tcp_host's gatherEnd exchanges it: `bytes` in `chunk`-byte pieces of one buffer, in order.
+const GatherPeer = struct {
+    w: *Wire,
+    tx: []const u8,
+    rx: []u8,
+    chunk: usize,
+    result: ?Error = null,
+
+    fn run(p: *GatherPeer) void {
+        var off: usize = 0;
+        while (off < p.tx.len) : (off += p.chunk) {
+            const len = @min(p.chunk, p.tx.len - off);
+            p.w.exchange(0x60003, p.tx[off..][0..len], p.rx[off..][0..len]) catch |e| {
+                p.result = e;
+                return;
+            };
+        }
+    }
+};
+
+test "a prompt half's hidden gather in tcp_host's chunks arrives whole on two threads, as on one" {
+    // 1,024 rows x 5,120 fp32 a rank (20,971,520 B) in 4 MiB chunks, striped from 4 MiB as served
+    const bytes: usize = 1024 * 5120 * 4;
+    const a = std.heap.page_allocator;
+    var bufs: [4][]u8 = undefined; // rank 0's and rank 1's blocks, and what each receives
+    for (&bufs) |*b| b.* = try a.alloc(u8, bytes);
+    defer for (bufs) |b| a.free(b);
+    fill(bufs[0], 11);
+    fill(bufs[1], 12);
+    for ([_]u8{ 1, 2 }) |threads| {
+        @memset(bufs[2], 0);
+        @memset(bufs[3], 0);
+        const fds = try pairs(2);
+        var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, threadedOpt(threads, 20 * std.time.ns_per_ms, 4 << 20));
+        var w1 = Wire.fromFds(1, fds[1][0..2], test_epoch, threadedOpt(threads, 20 * std.time.ns_per_ms, 4 << 20));
+        defer w0.close(std.time.ns_per_s);
+        defer w1.close(std.time.ns_per_s);
+        var p0: GatherPeer = .{ .w = &w0, .tx = bufs[0], .rx = bufs[2], .chunk = 4 << 20 };
+        var p1: GatherPeer = .{ .w = &w1, .tx = bufs[1], .rx = bufs[3], .chunk = 4 << 20 };
+        const t = try std.Thread.spawn(.{}, GatherPeer.run, .{&p1});
+        p0.run();
+        t.join();
+        try testing.expectEqual(@as(?Error, null), p0.result);
+        try testing.expectEqual(@as(?Error, null), p1.result);
+        // each rank holds the peer's block, every byte (so the two thread counts gather the same bytes)
+        try testing.expect(std.mem.eql(u8, bufs[1], bufs[2]));
+        try testing.expect(std.mem.eql(u8, bufs[0], bufs[3]));
+        try testing.expectEqual(@as(u64, 5), w0.seq);
+        try testing.expectEqual(@as(u64, 5), w1.seq);
+    }
+}
+
+test "two threads: a mismatch, a silent peer, a lost second link and an abort each end the call" {
+    const mib = 1 << 20;
+    const a = std.heap.page_allocator;
+    const buf = try a.alloc(u8, 2 * mib);
+    defer a.free(buf);
+    const in = try a.alloc(u8, 2 * mib);
+    defer a.free(in);
+    fill(buf, 3);
+    // the ranks issue different sizes: both fail, neither hangs
+    {
+        const fds = try pairs(2);
+        var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, threadedOpt(2, 0, mib));
+        var w1 = Wire.fromFds(1, fds[1][0..2], test_epoch, threadedOpt(2, 0, mib));
+        defer w0.close(std.time.ns_per_s);
+        defer w1.close(std.time.ns_per_s);
+        var p0: SumPeer = .{ .w = &w0, .sizes = &.{ 2 * mib, 2 * mib } };
+        var p1: SumPeer = .{ .w = &w1, .sizes = &.{ 2 * mib, 2 * mib + 2 } };
+        const t = try std.Thread.spawn(.{}, SumPeer.run, .{&p1});
+        p0.run();
+        t.join();
+        try testing.expect(p0.result != null and p1.result != null);
+        try testing.expect(p0.result.? == error.Mismatch or p1.result.? == error.Mismatch);
+    }
+    // a silent peer: the progress deadline, and the failure sticks
+    {
+        const fds = try pairs(2);
+        var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, threadedOpt(2, 0, mib));
+        const t0 = monotonicNs();
+        try testing.expectError(error.Timeout, w0.exchange(1, buf, in));
+        const took = monotonicNs() - t0;
+        try testing.expect(took >= 250 * std.time.ns_per_ms and took < 3 * std.time.ns_per_s);
+        try testing.expectError(error.Timeout, w0.exchange(1, buf, in));
+        w0.close(std.time.ns_per_s);
+        try testing.expect(w0.helper == null);
+        for (fds[1][0..2]) |fd| _ = c.close(fd);
+    }
+    // the peer's end of the second link (the helper's) is gone
+    {
+        const fds = try pairs(2);
+        var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, threadedOpt(2, 0, mib));
+        defer w0.close(std.time.ns_per_s);
+        _ = c.close(fds[1][1]);
+        try testing.expectError(error.PeerLost, w0.exchange(1, buf, in));
+        _ = c.close(fds[1][0]);
+    }
+    // abort from another thread while both threads wait
+    {
+        const fds = try pairs(2);
+        var o = threadedOpt(2, 0, mib);
+        o.progress_ns = 10 * std.time.ns_per_s;
+        var w0 = Wire.fromFds(0, fds[0][0..2], test_epoch, o);
+        defer w0.close(std.time.ns_per_s);
+        const Aborter = struct {
+            fn run(w: *Wire) void {
+                var d: c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+                _ = c.nanosleep(&d, null);
+                w.abort();
+            }
+        };
+        const t = try std.Thread.spawn(.{}, Aborter.run, .{&w0});
+        const t0 = monotonicNs();
+        try testing.expectError(error.Aborted, w0.exchange(1, buf, in));
+        try testing.expect(monotonicNs() - t0 < 2 * std.time.ns_per_s);
+        t.join();
+        for (fds[1][0..2]) |fd| _ = c.close(fd);
+    }
+}
+
+/// TF_WIRE_BENCH=1 (not a check: it prints): the exchange rate of 4 MiB chunks over loopback TCP, both ranks in this
+/// process, on one link, on two links with one thread, and on two links with a thread a link. The second link is a
+/// second connection to the same address, as TP_STRIPE = rank 0's own address makes it on one network card.
+/// TF_WIRE_BENCH_PORT: the first port (29876).
+const BenchPeer = struct {
+    rank: u16,
+    links: usize,
+    port: u16,
+    opt: Options,
+    chunks: usize,
+    seconds: f64 = 0,
+    result: ?Error = null,
+
+    fn run(p: *BenchPeer) void {
+        const a = std.heap.page_allocator;
+        const n: usize = 4 << 20;
+        const out = a.alloc(u8, n) catch return;
+        defer a.free(out);
+        const in = a.alloc(u8, n) catch return;
+        defer a.free(in);
+        fill(out, p.rank);
+        const lo: [4]u8 = .{ 127, 0, 0, 1 };
+        const addrs = [2][4]u8{ lo, lo };
+        var w = Wire.open(p.rank, addrs[0..p.links], p.port, test_epoch, p.opt) catch |e| {
+            p.result = e;
+            return;
+        };
+        defer w.close(std.time.ns_per_s);
+        for (0..8) |_| w.exchange(1, out, in) catch |e| {
+            p.result = e;
+            return;
+        };
+        const t0 = monotonicNs();
+        for (0..p.chunks) |_| w.exchange(1, out, in) catch |e| {
+            p.result = e;
+            return;
+        };
+        p.seconds = @as(f64, @floatFromInt(monotonicNs() - t0)) / 1e9;
+    }
+};
+
+test "bench: 4 MiB chunks over loopback TCP on one thread and on a thread a link (TF_WIRE_BENCH=1)" {
+    if (c.getenv("TF_WIRE_BENCH") == null) return error.SkipZigTest;
+    const base: u16 = if (c.getenv("TF_WIRE_BENCH_PORT")) |v| try std.fmt.parseInt(u16, std.mem.span(v), 10) else 29876;
+    const chunks: usize = 256;
+    const arms = [_]struct { name: []const u8, links: usize, threads: u8 }{
+        .{ .name = "1 link, 1 thread (served today)", .links = 1, .threads = 1 },
+        .{ .name = "2 links, 1 thread (the stripe alone)", .links = 2, .threads = 1 },
+        .{ .name = "2 links, 2 threads (TF_COLL_WIRE_THREADS=2)", .links = 2, .threads = 2 },
+    };
+    for (0..3) |pass| {
+        for (arms, 0..) |arm, i| {
+            const opt: Options = .{ .progress_ns = 5 * std.time.ns_per_s, .stripe_min = 4 << 20, .threads = arm.threads, .connect_ns = 5 * std.time.ns_per_s };
+            const port = base + @as(u16, @intCast((pass * arms.len + i) * 4));
+            var p0: BenchPeer = .{ .rank = 0, .links = arm.links, .port = port, .opt = opt, .chunks = chunks };
+            var p1: BenchPeer = .{ .rank = 1, .links = arm.links, .port = port, .opt = opt, .chunks = chunks };
+            const t = try std.Thread.spawn(.{}, BenchPeer.run, .{&p0});
+            p1.run();
+            t.join();
+            try testing.expectEqual(@as(?Error, null), p0.result);
+            try testing.expectEqual(@as(?Error, null), p1.result);
+            const gb = @as(f64, @floatFromInt(chunks * (4 << 20))) / 1e9;
+            std.debug.print("WIRE-BENCH pass {d}: {s}: {d} x 4 MiB each way in {d:.3} s = {d:.2} GB/s each way, {d:.2} ms a 20 MiB gather\n", .{ pass + 1, arm.name, chunks, p0.seconds, gb / p0.seconds, p0.seconds / @as(f64, @floatFromInt(chunks)) * 5.0 * 1000.0 });
+        }
+    }
 }
