@@ -82,7 +82,10 @@ stub() {  # stub CONF: the box files serve_load / serve_env read (RoPE tables, D
   mkdir -p "$dk" "$dd"; echo '{"commit": "c0ffee"}' > "$dd/DEPLOY.json"
   for f in rope-plain-cos rope-plain-sin rope-compressed-cos rope-compressed-sin; do truncate -s $((rows * 128)) "$dk/$f.f32"; done
 }
-for conf in "$PWD/serve.conf"; do
+# serve.conf's one deliberate argv change since the base is LOOP_POLICY (--loop-policy stop): compared with it unset,
+# which resolves to the base's LOOP_GUARD flag
+sed 's/^LOOP_POLICY=.*/LOOP_POLICY=/' "$PWD/serve.conf" > "$T/serve-nopolicy.conf"
+for conf in "$T/serve-nopolicy.conf"; do
   [ -f "$conf" ] || { echo "skip 6 $conf (not here)"; continue; }
   rm -rf "$T/box"; stub "$conf"
   for r in 0 1; do

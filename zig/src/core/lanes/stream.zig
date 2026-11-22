@@ -15,6 +15,7 @@ pub const Reason = enum {
     length,
     @"error",
     cancelled,
+    loop, // the loop policy `stop` ended the reply where an exact cycle was found
 
     pub fn name(r: Reason) []const u8 {
         return if (r == .none) "" else @tagName(r);
@@ -23,7 +24,7 @@ pub const Reason = enum {
 
 pub const Mode = enum { pipe, drain, verify, exit };
 
-// the longest exact cycle the thinking loop guard looks for
+// the longest exact cycle the loop detector looks for
 pub const loop_max_period: usize = 64;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
@@ -50,9 +51,31 @@ fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
     return null;
 }
 
-/// Return the first token index in a candidate batch that would fire the guard.
+/// What a thinking loop does to the reply. Every policy but `off` detects and reports (Stream.loop, Stream.answer_loop);
+/// `close` forces `think_close` so the model answers (the old --loop-guard), `stop` ends the reply at once with
+/// Reason.loop, `count` never acts. A loop in the answer (after `think_end`) is counted under every policy, never acted on.
+pub const LoopPolicy = enum {
+    off,
+    close,
+    stop,
+    count,
+
+    /// Whether the policy changes the reply when a thinking loop is found.
+    pub fn acts(p: LoopPolicy) bool {
+        return p == .close or p == .stop;
+    }
+
+    pub fn parse(text: []const u8) ?LoopPolicy {
+        return std.meta.stringToEnum(LoopPolicy, text);
+    }
+};
+
+/// Where a loop was found: its period and the emitted index (0-based) of the token that completed the cycle's run.
+pub const LoopHit = struct { period: u32, at_token: u32 };
+
+/// Return the first token index in a candidate batch that would fire an acting policy (close, stop).
 pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
-    if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
+    if (!s.loop_policy.acts() or !s.think_open or s.think_end < 0 or s.loop != null) return null;
     for (tokens, 0..) |token, i| {
         if (@as(i64, token) == s.think_end) return null;
         if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
@@ -156,13 +179,14 @@ pub const Spec = struct {
     think_close: []const u32 = &.{},
     think_end: i64 = -1,
     think_open: ?bool = null, // null: open when a budget is set (the server's rule)
-    loop_guard: bool = false,
+    loop_policy: LoopPolicy = .off,
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
     cache_key: []const u32 = &.{}, // with images: the ids the prompt caches key it by (empty: none kept or resumed)
     cache_spans: []const image_key.KeySpan = &.{}, // with images: each picture's span and whole digest
     structure: ?Structure = null, // the grammar every reply token keeps to (a backend's draws enforce it)
+    reap_bucket: u32 = 0, // Edge-REAP domain index (0: "default"). The text bucket byte is index * 2.
 };
 
 pub const Stream = struct {
@@ -179,14 +203,17 @@ pub const Stream = struct {
     think_close: []const u32,
     think_end: i64,
     think_open: bool,
-    loop_guard: bool,
-    loop_period: ?u32 = null,
+    loop_policy: LoopPolicy,
+    loop: ?LoopHit = null, // the thinking loop found (latched once)
+    answer_loop: ?LoopHit = null, // a loop in the answer, counted only (latched once)
+    answer_from: ?usize = null, // emitted index where the answer starts (after think_end; 0 when thinking never opened)
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
     cache_key: []const u32 = &.{},
     cache_spans: []const image_key.KeySpan = &.{},
     structure: ?Structure = null,
+    reap_bucket: u32 = 0,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
@@ -238,15 +265,17 @@ pub const Stream = struct {
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
-            .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
-            .loop_guard = spec.loop_guard,
+            .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_policy != .off and spec.think_end >= 0)),
+            .loop_policy = spec.loop_policy,
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
             .cache_key = spec.cache_key,
             .cache_spans = spec.cache_spans,
             .structure = spec.structure,
+            .reap_bucket = spec.reap_bucket,
         };
+        if (!s.think_open) s.answer_from = 0;
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
     }
@@ -343,20 +372,29 @@ pub const Stream = struct {
             if (s.finished) break;
             try s.context.append(gpa, t);
             landed += 1;
-            if (@as(i64, t) == s.think_end) s.think_open = false;
-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
+            if (@as(i64, t) == s.think_end) {
+                s.think_open = false;
+                if (s.answer_from == null) s.answer_from = s.emitted().len;
+            }
+            const fire = if (s.loop_policy != .off and s.think_open and s.think_end >= 0 and s.loop == null) detectLoop(s.emitted()) else null;
+            s.noteAnswerLoop();
             if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;
             } else if (fire) |period| {
-                s.loop_period = period;
+                s.loop = .{ .period = period, .at_token = @intCast(s.emitted().len - 1) };
                 if (s.emitted().len >= s.max_new) {
                     s.finished = true;
                     s.reason = .length;
+                } else if (s.loop_policy == .count) {
+                    continue; // recorded, never acted on: the stream goes on as with the policy off
+                } else if (s.loop_policy == .stop) {
+                    s.finished = true;
+                    s.reason = .loop;
                 } else if (s.think_close.len == 0) {
                     s.finished = true;
                     s.reason = .stop;
-                } else {
+                } else { // close
                     s.think_open = false;
                     s.force.clearRetainingCapacity();
                     try s.force.appendSlice(gpa, s.think_close);
@@ -368,6 +406,14 @@ pub const Stream = struct {
             }
         }
         return landed;
+    }
+
+    /// Count (never act on) an exact cycle in the answer: the same rule as the thinking loop, over the answer's tokens.
+    fn noteAnswerLoop(s: *Stream) void {
+        if (s.loop_policy == .off or s.answer_loop != null or s.think_open) return;
+        const from = s.answer_from orelse return;
+        const all = s.emitted();
+        if (detectLoop(all[from..])) |period| s.answer_loop = .{ .period = period, .at_token = @intCast(all.len - 1) };
     }
 
     fn stopped(s: *const Stream) bool {
@@ -390,17 +436,17 @@ test "commit stops at eos and length" {
     try std.testing.expect(s.finished and s.reason == .stop);
 }
 
-test "loop guard stops at the cap even when no cycle fires" {
+test "loop policy close stops at the cap even when no cycle fires" {
     const gpa = std.testing.allocator;
     var tokens: [20]u32 = undefined;
     for (&tokens, 0..) |*token, i| token.* = @intCast(100 + i);
-    var guarded = try Stream.init(gpa, .{ .id = "guarded", .prompt = &.{1}, .max_new = 10, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+    var guarded = try Stream.init(gpa, .{ .id = "guarded", .prompt = &.{1}, .max_new = 10, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .close });
     defer guarded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens));
     try std.testing.expect(guarded.finished and guarded.reason == .length);
 }
 
-test "loop guard sees a long sentence cycle (29 tokens) and not one past the longest period" {
+test "loop policy close sees a long sentence cycle (29 tokens) and not one past the longest period" {
     const gpa = std.testing.allocator;
     const Case = struct { period: usize, fires: bool };
     for ([_]Case{ .{ .period = 29, .fires = true }, .{ .period = loop_max_period, .fires = true }, .{ .period = loop_max_period + 1, .fires = false } }) |c| {
@@ -409,34 +455,139 @@ test "loop guard sees a long sentence cycle (29 tokens) and not one past the lon
         for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i)); // the reasoning before the loop
         const n = loop_warm_in + loop_min_run + c.period + 3 * c.period; // the cycle a few times past the guard's run
         while (tokens.items.len < n) try tokens.append(gpa, @intCast(2000 + (tokens.items.len - loop_warm_in) % c.period));
-        var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+        var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .close });
         defer s.deinit(gpa);
         const landed = try s.commit(gpa, tokens.items);
         if (c.fires) {
             // it fires at the first token that completes loop_min_run tokens of the cycle after its first round
             try std.testing.expectEqual(loop_warm_in + c.period + loop_min_run, landed);
-            try std.testing.expectEqual(@as(u32, @intCast(c.period)), s.loop_period.?);
+            try std.testing.expectEqual(@as(u32, @intCast(c.period)), s.loop.?.period);
+            try std.testing.expectEqual(@as(u32, @intCast(landed - 1)), s.loop.?.at_token);
             try std.testing.expect(!s.finished and !s.think_open and s.force.items.len == 3);
         } else {
             try std.testing.expectEqual(n, landed);
-            try std.testing.expect(s.loop_period == null and s.think_open);
+            try std.testing.expect(s.loop == null and s.think_open);
         }
     }
 }
 
-test "loop guard fires, closes thinking, and latches once" {
+test "loop policy close fires, closes thinking, and latches once" {
     const gpa = std.testing.allocator;
     var tokens: std.ArrayList(u32) = .empty;
     defer tokens.deinit(gpa);
     for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i));
     for (0..257) |_| try tokens.append(gpa, 7);
-    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 400, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 400, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .close });
     defer s.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items));
-    try std.testing.expectEqual(@as(u32, 1), s.loop_period.?);
+    try std.testing.expectEqual(@as(u32, 1), s.loop.?.period);
     try std.testing.expect(!s.finished and !s.think_open and s.force.items.len == 3);
     while (s.popForce()) |token| _ = try s.commit(gpa, &.{token});
     try std.testing.expect(!s.finished and s.force.items.len == 0);
     _ = try s.commit(gpa, &.{8});
-    try std.testing.expect(!s.finished and s.loop_period.? == 1);
+    try std.testing.expect(!s.finished and s.loop.?.period == 1);
+}
+
+/// 64 distinct reasoning tokens, then one token repeated: the period-1 cycle fires at emitted index 64 + 256 = 320.
+fn loopTokens(gpa: Allocator, extra: usize) !std.ArrayList(u32) {
+    var tokens: std.ArrayList(u32) = .empty;
+    for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i));
+    for (0..loop_min_run + 1 + extra) |_| try tokens.append(gpa, 7);
+    return tokens;
+}
+
+test "loop policy stop ends the reply at detection with reason loop" {
+    const gpa = std.testing.allocator;
+    var tokens = try loopTokens(gpa, 40);
+    defer tokens.deinit(gpa);
+    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .stop });
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items));
+    try std.testing.expect(s.finished and s.reason == .loop);
+    try std.testing.expectEqualStrings("loop", s.reason.name());
+    try std.testing.expectEqual(LoopHit{ .period = 1, .at_token = 320 }, s.loop.?);
+    try std.testing.expect(s.force.items.len == 0 and s.think_open); // no forced close, no answer
+    try std.testing.expectEqual(@as(?usize, null), loopCut(&s, &.{7})); // latched: nothing more is cut
+}
+
+test "loop policy stop: the round loop cuts a drafted batch at the firing token" {
+    const gpa = std.testing.allocator;
+    var tokens = try loopTokens(gpa, 0);
+    defer tokens.deinit(gpa);
+    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .stop });
+    defer s.deinit(gpa);
+    _ = try s.commit(gpa, tokens.items[0..300]);
+    const sevens: [30]u32 = @splat(7);
+    try std.testing.expectEqual(@as(?usize, 20), loopCut(&s, &sevens));
+    var counted = try Stream.init(gpa, .{ .id = "count", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .count });
+    defer counted.deinit(gpa);
+    _ = try counted.commit(gpa, tokens.items[0..300]);
+    try std.testing.expectEqual(@as(?usize, null), loopCut(&counted, &sevens)); // count never cuts
+}
+
+test "loop policy count records the loop and leaves the stream as policy off" {
+    const gpa = std.testing.allocator;
+    var tokens = try loopTokens(gpa, 100);
+    defer tokens.deinit(gpa);
+    try tokens.appendSlice(gpa, &.{ 90, 91, 92, 40, 41 });
+    var off = try Stream.init(gpa, .{ .id = "off", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_open = true });
+    defer off.deinit(gpa);
+    var counted = try Stream.init(gpa, .{ .id = "count", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = .count });
+    defer counted.deinit(gpa);
+    try std.testing.expectEqual(try off.commit(gpa, tokens.items), try counted.commit(gpa, tokens.items));
+    try std.testing.expectEqualSlices(u32, off.emitted(), counted.emitted());
+    try std.testing.expectEqual(off.finished, counted.finished);
+    try std.testing.expectEqual(off.think_open, counted.think_open);
+    try std.testing.expect(off.loop == null and off.answer_loop == null);
+    try std.testing.expectEqual(LoopHit{ .period = 1, .at_token = 320 }, counted.loop.?);
+    try std.testing.expect(counted.force.items.len == 0 and !counted.finished);
+}
+
+test "a loop in the answer is counted under every policy and never acted on" {
+    const gpa = std.testing.allocator;
+    for ([_]LoopPolicy{ .close, .stop, .count }) |policy| {
+        var tokens: std.ArrayList(u32) = .empty;
+        defer tokens.deinit(gpa);
+        for (0..10) |i| try tokens.append(gpa, @intCast(1000 + i)); // short reasoning
+        try tokens.appendSlice(gpa, &.{ 90, 91, 92 }); // closed by the model: the answer starts at emitted index 12 (the 92)
+        for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(3000 + i));
+        for (0..loop_min_run + 2 + 50) |i| try tokens.append(gpa, @intCast(40 + i % 2)); // a period-2 answer cycle
+        var s = try Stream.init(gpa, .{ .id = "answer", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_policy = policy });
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(tokens.items.len, try s.commit(gpa, tokens.items));
+        try std.testing.expect(!s.finished and s.loop == null and s.force.items.len == 0);
+        // the cycle starts at answer index 65; its run (256 tokens matching 2 back) completes at answer index 322: emitted 12 + 322
+        try std.testing.expectEqual(LoopHit{ .period = 2, .at_token = 334 }, s.answer_loop.?);
+    }
+    // with no think block at all (thinking off), the whole reply is the answer
+    var tokens: std.ArrayList(u32) = .empty;
+    defer tokens.deinit(gpa);
+    for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(3000 + i));
+    for (0..loop_min_run + 1) |_| try tokens.append(gpa, 5);
+    var plain = try Stream.init(gpa, .{ .id = "plain", .prompt = &.{1}, .max_new = 4096, .loop_policy = .stop });
+    defer plain.deinit(gpa);
+    _ = try plain.commit(gpa, tokens.items);
+    try std.testing.expect(!plain.finished and plain.loop == null);
+    try std.testing.expectEqual(LoopHit{ .period = 1, .at_token = 320 }, plain.answer_loop.?);
+    var off = try Stream.init(gpa, .{ .id = "off", .prompt = &.{1}, .max_new = 4096 });
+    defer off.deinit(gpa);
+    _ = try off.commit(gpa, tokens.items);
+    try std.testing.expect(off.answer_loop == null); // policy off: nothing is detected
+}
+
+test "loop policy names parse; only close and stop act" {
+    try std.testing.expectEqual(LoopPolicy.stop, LoopPolicy.parse("stop").?);
+    try std.testing.expectEqual(@as(?LoopPolicy, null), LoopPolicy.parse("guard"));
+    try std.testing.expect(LoopPolicy.close.acts() and LoopPolicy.stop.acts() and !LoopPolicy.count.acts() and !LoopPolicy.off.acts());
+}
+
+test "loop policy close with no think_close ends the reply with reason stop, as the old guard did" {
+    const gpa = std.testing.allocator;
+    var tokens = try loopTokens(gpa, 10);
+    defer tokens.deinit(gpa);
+    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_end = 91, .loop_policy = .close });
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items));
+    try std.testing.expect(s.finished and s.reason == .stop and s.force.items.len == 0);
+    try std.testing.expectEqual(LoopHit{ .period = 1, .at_token = 320 }, s.loop.?);
 }

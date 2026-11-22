@@ -414,3 +414,45 @@ test "world 4: TF_DS_VGATHER quarters match the four copies, R = 1..8, and the d
     try std.testing.expect(!thin_on.site_swap12);
     try std.testing.expectEqual(3 * thin[0] * 4, thin_on.bytes);
 }
+
+test "world 4: chunk parity refuses an odd Engram column split and passes the deployed DeepSeek-V4.1 shapes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = @import("config.zig");
+    const plan = @import("plan.zig");
+    var why: cfg.Why = .{};
+    const c = try cfg.parse(arena.allocator(), cfg.test_config, &why);
+    var buf: [384]u8 = undefined;
+    const width = struct {
+        fn of(cc: cfg.Config, p: u32) usize {
+            const s: plan.Split = .{ .rank = 0, .world = 2, .pair = p };
+            const r = s.engramCols(cc).?;
+            return r[1] - r[0];
+        }
+    }.of;
+    // the deployed model: 25,600 columns = 200 blocks, 12,800 / 12,800, every slot size and row count holds
+    const ew: [2]usize = .{ width(c, 0), width(c, 1) };
+    try std.testing.expectEqual([2]usize{ 12800, 12800 }, ew);
+    try std.testing.expect(prompt2d.chunkParityMessage(&buf, prompt2d.engram_exchange, ew, 4, 2048, null) == null);
+    for ([_]u64{ 4096, 65536, 1 << 20 }) |h| try std.testing.expect(prompt2d.chunkParityMessage(&buf, prompt2d.engram_exchange, ew, 4, 2048, h) == null);
+    try prompt2d.checkChunkParity(prompt2d.engram_exchange, ew, 4, 2048, null);
+    // an odd block count (205 blocks: 103 / 102) gives different widths, and the check names the tensor
+    var odd = c;
+    odd.hidden = 5248;
+    const ow: [2]usize = .{ width(odd, 0), width(odd, 1) };
+    try std.testing.expectEqual([2]usize{ 103 * 128, 102 * 128 }, ow);
+    const m0 = prompt2d.chunkParityMessage(&buf, prompt2d.engram_exchange, ow, 4, 2048, null).?;
+    try std.testing.expect(std.mem.indexOf(u8, m0, "engram.wkv") != null);
+    // with a known slot, the first row count whose chunk counts differ is reported (1 row: 13,184 * 4 = 52,736 bytes vs 13,056 * 4 = 52,224 over a 52,224-byte half: 2 chunks vs 1)
+    var buf2: [384]u8 = undefined;
+    const m1 = prompt2d.chunkParityMessage(&buf2, prompt2d.engram_exchange, ow, 4, 2048, 52224).?;
+    try std.testing.expect(std.mem.indexOf(u8, m1, "engram.wkv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m1, "pair 0 takes 2 slot chunks and pair 1 1 at 1 rows") != null);
+    // a slot so large that both pairs always fit one chunk is not a mismatch
+    try std.testing.expect(prompt2d.chunkParityMessage(&buf, prompt2d.engram_exchange, ow, 4, 8, 1 << 30) == null);
+    // the refusal init propagates (checkChunkParity logs msg and returns it)
+    var msg: []const u8 = "";
+    try std.testing.expectError(error.ChunkCountMismatch, prompt2d.refuseChunkMismatch(&buf, &msg, prompt2d.engram_exchange, ow, 4, 2048, null));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "engram.wkv") != null);
+    try prompt2d.refuseChunkMismatch(&buf, &msg, prompt2d.engram_exchange, ew, 4, 2048, null);
+}

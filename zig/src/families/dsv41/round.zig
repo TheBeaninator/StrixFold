@@ -112,7 +112,8 @@ pub const Rows = struct {
 };
 
 /// A window of a concurrent round: its first row, its rows, its stream's ids through the window (Engram's n-grams).
-pub const Window = struct { row: usize, n: usize, seq: []const i32 };
+/// reap_bucket is the text bucket byte (domain index * 2). Decode routing is always text.
+pub const Window = struct { row: usize, n: usize, seq: []const i32, reap_bucket: u32 = 0 };
 
 /// The index tensors rounds.py's _ix makes from a round's inputs, by row (int64 [R] each, gi [R, 2]).
 const Glue = enum(u8) { wslot, wbase, cbase1, ctarget1, gpos1, vis1, cbase2, ctarget2, gpos2, vis2, rslot, gi };
@@ -193,6 +194,8 @@ pub const Round = struct {
     f2_cnt: u64, // int32 [16]: TF_FUSE2's arrival counters ([0] tri_norm.gateRoute's), zero; launches leave them zero
     pick: u64, // int32 [R, slots]
     mw: u64, // fp32 [R, slots]
+    pick_home: u64 = 0, // the arena pick, remembered the first time REAP redirects it
+    wts_home: u64 = 0,
     // a block whose shared expert runs alone (weights.Layer.shared; zero when none does): the routed slots' picks and
     // weights [R, slots - 1], its gate / up (fp32 [R, I]) and their activation (bf16 [R, I])
     pick_r: u64 = 0,
@@ -340,6 +343,8 @@ pub const Round = struct {
         rd.gl = try a.take(R * (d / 256) * c.experts * 4);
         rd.pick = try a.take(R * e.slots() * 4);
         rd.mw = try a.take(R * e.slots() * 4);
+        rd.pick_home = 0;
+        rd.wts_home = 0;
         rd.pm = try a.take(R * d * 4);
         rd.gm = try a.take(e.world * R * d * 4);
         rd.pick_r = 0;
@@ -821,6 +826,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const c = e.c;
     const R = rd.r;
     const sl = e.slots();
+    prompt.reapRedirectPick(e, &rd.pick_home, &rd.wts_home, &rd.pick, &rd.mw, 0, 0, li);
     // the shared expert's id, in every row's last slot: the table's last entry, or past it when it runs alone
     // (TF_FUSE2: the chunk sums and the routing as one launch, tri_norm.gateRoute)
     try tri_norm.gateRoute(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, rd.f2_cnt, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - @intFromBool(lay.shared == null), rd.pick, rd.mw, R, c.hidden, c.experts, sl);
@@ -831,6 +837,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
         try prompt.compactSlots(e, rd.pick, rd.mw, rd.pick_r, rd.mw_r, sl, R);
         var xsd = ch.xsd;
         xsd.slots = sl - 1;
+        xsd.reap_y = prompt.reapDownY(e, 0, 0, li, sl - 1);
         try exl3_experts.decode(e.ex, e.s, lay.experts, xsd, rd.x, c.hidden, rd.pick_r, rd.mw_r, rd.moeOut(e), R, c.swiglu_limit);
         try prompt.sharedExpert(e, ch, sh, rd.x, R, .{ .g = rd.sh_g, .u = rd.sh_u, .h = rd.sh_h, .y = rd.sh_y }, rd.moeOut(e), true);
     } else if (two2d(e)) |tw| {
@@ -839,8 +846,14 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
         try rd.mark(e, .m_gu);
         try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.xsd.slots, tw.gu, 2);
         try rd.mark(e, .m_x);
-        try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
-    } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.moeOut(e), R, c.swiglu_limit);
+        var xsd = ch.xsd;
+        xsd.reap_y = prompt.reapDownY(e, 0, 0, li, xsd.slots);
+        try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
+    } else {
+        var xsd = ch.xsd;
+        xsd.reap_y = prompt.reapDownY(e, 0, 0, li, xsd.slots);
+        try exl3_experts.decode(e.ex, e.s, lay.experts, xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.moeOut(e), R, c.swiglu_limit);
+    }
     // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
     // 4 MiB of its wkv), after the last layer the head
     if (li + 1 < e.w.layers.len) {

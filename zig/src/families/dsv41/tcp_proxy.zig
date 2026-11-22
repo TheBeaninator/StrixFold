@@ -306,7 +306,11 @@ pub const TcpProxy = struct {
     begun: ?Begun = null,
 
     const Begun = struct { host: bool, recv: u64, bytes: usize };
-    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .exchange = exchangeColl, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+
+    pub fn providesExchange() bool {
+        return vtable.exchange != null;
+    }
 
     /// (read after the stream synchronized: the proxy threads' wire counts are then settled)
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
@@ -387,6 +391,16 @@ pub const TcpProxy = struct {
 
     pub fn blocks(bytes: usize) u32 {
         return @intCast(std.math.clamp((bytes + 4095) / 4096, 1, 64));
+    }
+
+    /// The host link's point to point (tcp_coll.exchangeColl). A slot gather stays on the proxy; REAP's partials
+    /// are one exchange and do not fit the proxy's all-gather slot layout, so they take the host path.
+    fn exchangeColl(ptr: *anyopaque, stream: gpu.Stream, site: coll.Site, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, peer: u32) coll.Error!void {
+        const t: *TcpProxy = @ptrCast(@alignCast(ptr));
+        if (t.status()) |e| return e;
+        if (t.begun != null) return t.misuse("an exchange while a begun gather is pending");
+        const f = t.host.coll_().vtable.exchange orelse return t.misuse("an exchange this transport does not provide");
+        return f(t.host, stream, site, send, send_bytes, recv, recv_bytes, peer);
     }
 
     fn allGather(ptr: *anyopaque, stream: gpu.Stream, site: coll.Site, send: u64, recv: u64, bytes: usize) coll.Error!void {

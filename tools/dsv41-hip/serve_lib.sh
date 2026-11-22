@@ -139,6 +139,7 @@ serve_load() {
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
   for v in REPLAY_FLOOR PLACE_VICTIM GPU_COUNTS HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
+  serve_loop_policy
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
   # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
   [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
@@ -159,6 +160,15 @@ serve_load() {
       [ -z "${!k:-}" ] || [[ ${!k} =~ ^[0-9]+$ ]] || die "$k must be a whole number, not ${!k}"
     done
   fi
+}
+
+# serve_loop_policy: LOOP_POLICY = off | close | stop | count; unset or empty: LOOP_GUARD's old
+# meaning (1 or unset = close, 0 = off), so a configuration written before LOOP_POLICY keeps its behaviour.
+serve_loop_policy() {
+  if [ -z "${LOOP_POLICY:-}" ]; then
+    if [ "${LOOP_GUARD:-1}" = 1 ]; then LOOP_POLICY=close; else LOOP_POLICY=off; fi
+  fi
+  case $LOOP_POLICY in off|close|stop|count) ;; *) die "LOOP_POLICY must be off, close, stop or count, not $LOOP_POLICY";; esac
 }
 
 # serve_disk_on: true when the configuration turns sf-disk on (PROMPT_DISK_GIB > 0).
@@ -343,6 +353,20 @@ serve_env() {
   # TF_DS_VGATHER, read when the world-4 collective opens (every rank). 1 = a multi-row
   # equal-width quarters is assembled with two copy_rows16; the all-gather is the one issued with it off.
   [ "${VGATHER:-0}" = 0 ] || SERVE_ENV+=(TF_DS_VGATHER="$VGATHER")
+  # passive Edge-REAP counters. Every rank reads the schedule (the handshake's
+  # plan token). Rank 0 also gets the snapshot dir, the snapshot interval and the served model id. Off (0 or
+  # unset): none of these are exported, and the engine's plan text stays the stock one.
+  if [ "${REAP_STATS:-0}" = 1 ]; then
+    SERVE_ENV+=(TF_DS_REAP_STATS=1)
+    SERVE_ENV+=(TF_DS_REAP_EVERY="${REAP_EVERY:-8}")
+    SERVE_ENV+=(TF_DS_REAP_PREFILL_ROWS="${REAP_PREFILL_ROWS:-4}")
+    SERVE_ENV+=(TF_DS_REAP_BUCKETS="${REAP_BUCKETS:-16}")
+    if [ "$RANK" = 0 ]; then
+      [ -n "${REAP_DIR:-}" ] && SERVE_ENV+=(TF_DS_REAP_DIR="$REAP_DIR")
+      SERVE_ENV+=(TF_DS_REAP_SNAPSHOT_MIN="${REAP_SNAPSHOT_MIN:-10}")
+      [ -n "${SERVE_NAME:-}" ] && SERVE_ENV+=(TF_DS_SERVED_NAME="$SERVE_NAME")
+    fi
+  fi
   # the prefetch's forked stream overlaps the graph's main branch only with HIP's segment scheduling (a debug variable)
   [ "$L2_PREFETCH" = 1 ] && SERVE_ENV+=(DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1)
   # the split doubles Chunk's cap-independent buffers (+474 MB at 16K, +0.62-0.68 GiB per rank at 63,488): serve.conf keeps it on (PREFILL_SPLIT_LARGE=1); LARGE=0 clears it above 16384
@@ -416,7 +440,8 @@ serve_cmd() {
       --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE"
       --prompt-cache-gib "$PROMPT_CACHE_GIB" --no-update-check)
     [ "$THINKING" = 1 ] && SERVE_CMD+=(--thinking) || SERVE_CMD+=(--no-thinking)
-    [ "$LOOP_GUARD" = 1 ] && SERVE_CMD+=(--loop-guard)
+    # close goes as --loop-guard (the argv of a build without --loop-policy); stop and count as --loop-policy; off: neither
+    case ${LOOP_POLICY:-off} in close) SERVE_CMD+=(--loop-guard);; stop|count) SERVE_CMD+=(--loop-policy "$LOOP_POLICY");; esac
     # (0: the flag is left out, the argv of a build without it)
     awk -v t="$DRAFT_TEMPERATURE" 'BEGIN { exit !(t > 0) }' && SERVE_CMD+=(--draft-temperature "$DRAFT_TEMPERATURE")
     [ "$DRAFTS" = 1 ] || SERVE_CMD+=(--no-drafts)

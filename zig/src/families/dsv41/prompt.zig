@@ -35,6 +35,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const dense = @import("dense.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
+const reap = @import("reap.zig");
 
 /// The four-node 2D split (prompt2d.zig) and the verbs RDMA ring (rdma.zig) exist in CUDA builds only
 /// (gpu.features): on HIP their types are empty and two2d() is null at compile time, so none of their code is built.
@@ -142,6 +143,13 @@ pub const Engine = struct {
     // engramHalves' rows exchange (engramPeerLoad), by Engram layer: the peer rank's projection of this rank's column
     // half (colHalf of its linear: its strips' words and svh, and its suh); null: the fp32 projections exchange
     engram_peer: [2]?weights.Linear = .{ null, null },
+    /// Edge-REAP stats (TF_DS_REAP_STATS=1). Null, and the three functions null: every launch is the base's.
+    reap: ?*anyopaque = null,
+    /// which 0: a decode round, 1: a prompt chunk. pick == 0: leave the caller's buffer.
+    reap_picks: ?*const fn (*anyopaque, u8, u8, u32) reap.PickPair = null,
+    /// 0: the scratch's own y. Nonzero: that down epilogue's y, and its discard cleared.
+    reap_down_y: ?*const fn (*anyopaque, u8, u8, u32, u32) u64 = null,
+    reap_note: ?*const fn (*anyopaque, reap.LayerNote) anyerror!void = null,
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank, at `site`: the RDMA ring when the
     /// engine has one and the slice fits a slot (whole float4s), else the Coll. The same bytes either way.
@@ -172,6 +180,55 @@ pub const Engine = struct {
         return (e.c.window + ring_extra) * e.c.head_dim * 2;
     }
 };
+
+/// Point a layer's router outputs at the REAP staging slice. The first call remembers `pick`/`wts` (the arena
+/// buffers). A layer past the MoE restores them. Off (no function): the pointers are not touched.
+pub fn reapRedirectPick(e: *const Engine, home_pick: *u64, home_wts: *u64, pick: *u64, wts: *u64, which: u8, bank: u8, li: usize) void {
+    const f = e.reap_picks orelse return;
+    const ctx = e.reap orelse return;
+    if (home_pick.* == 0) {
+        home_pick.* = pick.*;
+        home_wts.* = wts.*;
+    }
+    if (li >= reap.moe_layers) {
+        pick.* = home_pick.*;
+        wts.* = home_wts.*;
+        return;
+    }
+    const p = f(ctx, which, bank, @intCast(li));
+    if (p.pick != 0) {
+        pick.* = p.pick;
+        wts.* = p.wts;
+    }
+}
+
+/// The down epilogue's y for this layer. 0 keeps the scratch buffer and the base discard.
+pub fn reapDownY(e: *const Engine, which: u8, bank: u8, li: usize, slots: usize) u64 {
+    const f = e.reap_down_y orelse return 0;
+    const ctx = e.reap orelse return 0;
+    if (li >= reap.moe_layers) return 0;
+    return f(ctx, which, bank, @intCast(li), @intCast(slots));
+}
+
+/// kind 0: this layer has no per-slot partial. 1: y was redirected (decode only; prompts do not). 2: pack `src`.
+pub fn reapNoteCapture(e: *const Engine, li: usize, rows: usize, slots: usize, src: u64, bank: u8, kind: u8) !void {
+    const f = e.reap_note orelse return;
+    const ctx = e.reap orelse return;
+    const cap: reap.Capture = switch (kind) {
+        1 => .y_staged,
+        2 => .pf_z,
+        else => .skip,
+    };
+    try f(ctx, .{
+        .li = @intCast(li),
+        .rows = @intCast(rows),
+        .slots = @intCast(slots),
+        .src = src,
+        .capture = cap,
+        .bank = bank,
+        .which = 1,
+    });
+}
 
 /// A prompt chunk's buffers for up to `cap` rows (model.py _forward_k's and its steps' torch.empty's).
 /// An image span of the prompt: positions [at, at + len), its rows from row `row` of the image rows buffer.
@@ -267,6 +324,9 @@ pub const Chunk = struct {
     logits: u64, // fp32 [cap, experts]
     pick: u64, // int32 [cap, slots]
     wts: u64, // fp32 [cap, slots]
+    reap_bank: u8 = 0, // fillSplit's second chunk is bank 1 (its y and picks stay off the first chunk's)
+    pick_home: u64 = 0, // the arena pick, remembered the first time REAP redirects it
+    wts_home: u64 = 0,
     // a block whose shared expert runs alone (weights.Layer.shared; zero when none does): the routed slots' picks and
     // weights (int32 / fp32 [cap, slots - 1]), its gate and up (fp32 [cap, I]) and their activation (bf16 [cap, I])
     pick_r: u64 = 0,
@@ -377,6 +437,9 @@ pub const Chunk = struct {
         ch.logits = try a.take(cap * c.experts * 4);
         ch.pick = try a.take(cap * sl * 4);
         ch.wts = try a.take(cap * sl * 4);
+        ch.reap_bank = 0;
+        ch.pick_home = 0;
+        ch.wts_home = 0;
         ch.pick_r = 0;
         ch.wts_r = 0;
         ch.sh_g = 0;
@@ -605,6 +668,7 @@ pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: us
         @field(sc, f) = ptr;
         if (j == 12) try fill32(e, ptr, 0xffffffff, sz[j] / 4) else try fill(e, ptr, 0, sz[j]);
     }
+    sc.reap_y = 0; // (sc starts undefined: the field default does not apply)
     return sc;
 }
 
@@ -1153,6 +1217,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
 
 /// The gate, the routing and routeSpans. moe and moeUp both start here, so the picks match.
 pub fn moeRoute(e: *const Engine, ch: *Chunk, li: usize) !void {
+    reapRedirectPick(e, &ch.pick_home, &ch.wts_home, &ch.pick, &ch.wts, 1, ch.reap_bank, li);
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -1209,6 +1274,7 @@ fn moeBody(e: *const Engine, ch: *Chunk, li: usize) !void {
     var wts = ch.wts;
     var xsd = ch.xsd;
     var xs = ch.xs;
+    var slots_used = sl;
     if (lay.shared != null) {
         // the routed slots alone through the table; the shared expert (the last slot, weight 1) after them below
         try compactSlots(e, ch.pick, ch.wts, ch.pick_r, ch.wts_r, sl, n);
@@ -1216,12 +1282,26 @@ fn moeBody(e: *const Engine, ch: *Chunk, li: usize) !void {
         wts = ch.wts_r;
         xsd.slots = sl - 1;
         xs.slots = sl - 1;
+        slots_used = sl - 1;
     }
-    // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
+    // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch.
+    // y stays on that scratch. The sampled rows are packed from it after the layer, so prompt chunks
+    // do not need a second REAP y bank. Decode rounds still redirect y (round.zig).
     if (n < exl3_experts.exact_rows) {
+        xsd.reap_y = 0;
         try exl3_experts.decode(e.ex, e.s, lay.experts, xsd, ch.x, d, pick, wts, ch.moeOut(e), n, c.swiglu_limit);
+        if (e.reap_note != null) try reapNoteCapture(e, li, n, slots_used, xsd.y, ch.reap_bank, 2);
     } else {
+        var cap: u8 = 0;
+        var src: u64 = 0;
+        if (e.reap_note != null) {
+            if (exl3_experts.pfPlan(lay.experts, xs, ch.x, d, pick, wts, ch.moeOut(e), n, c.swiglu_limit) != null) {
+                cap = 2;
+                src = xs.z;
+            }
+        }
         try exl3_experts.prompt(e.ex, e.s, lay.experts, xs, ch.x, d, pick, wts, ch.moeOut(e), n, c.swiglu_limit);
+        try reapNoteCapture(e, li, n, xs.slots, src, ch.reap_bank, cap);
         if (pfHistOn()) try pfHist(e, ch, li, lay.experts.count);
     }
     if (lay.shared) |sh| try sharedExpert(e, ch, sh, ch.x, n, .{ .g = ch.sh_g, .u = ch.sh_u, .h = ch.sh_h, .y = ch.sh_y }, ch.moeOut(e), false);

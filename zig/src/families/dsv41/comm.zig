@@ -98,6 +98,10 @@ pub const Comm = struct {
 
     const coll_vtable: coll_mod.Coll.VTable = .{ .all_gather = collGather, .exchange = collExchange, .abort = collAbort, .close = collClose };
 
+    pub fn providesExchange() bool {
+        return coll_vtable.exchange != null;
+    }
+
     fn poisoned(c: *Comm) coll_mod.Error!void {
         return switch (@as(Poison, @enumFromInt(c.poison.load(.acquire)))) {
             .none => {},

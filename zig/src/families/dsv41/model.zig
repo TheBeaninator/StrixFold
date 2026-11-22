@@ -38,6 +38,8 @@ const coll = @import("coll.zig");
 const fan_mod = @import("fan.zig");
 /// HIP builds: kernel sets from the AMD kit (CUDA builds never reference it).
 const hip_load = @import("hip_load.zig");
+const reap = @import("reap.zig");
+const reap_dev = @import("reap_dev.zig");
 const tri_aux = @import("tri_aux.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
@@ -173,6 +175,8 @@ pub const Model = struct {
     // TF_DS_PREFILL_SPLIT: a chunk's second half (fillSplit; ch then holds the first), and the fewest rows of a first
     // half worth splitting for (0: off)
     ch2: ?prompt.Chunk = null,
+    /// Edge-REAP device state. Null unless TF_DS_REAP_STATS=1 (then every rank holds one).
+    reap: ?*reap_dev.State = null,
     split_min: usize = 0,
     // TF_DS_ENGRAM_ROWS=0: fillSplit's Engram phase 0 moves the fp32 projections of the peer's columns, as before the
     // rows exchange (prompt.engramPeerLoad; the same bits either way)
@@ -254,6 +258,7 @@ pub const Model = struct {
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, o: Options) !*Model {
+        if (reap.statsOn() and gpu.backend != .hip) return error.MissingKernel;
         if (o.world != 2 and o.world != 4) return error.BadWorld; // TP2, or the four-node 2D split (prompt2d.zig)
         if (o.world == 4 and !gpu.features.world4) return error.BadWorld; // a build without the 2D split (prompt2d.zig)
         if (o.rdma_devices != null and !gpu.features.verbs_rdma) return error.NoVerbsRdma;
@@ -313,6 +318,7 @@ pub const Model = struct {
         m.two = null;
         m.rdma_rings = null;
         m.ch2 = null;
+        m.reap = null;
         // every rank alike (the plan text carries it)
         m.split_min = if (std.c.getenv("TF_DS_PREFILL_SPLIT")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadSetting else 0;
         m.split_zip = if (std.c.getenv("TF_DS_PREFILL_SPLIT_ZIP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
@@ -517,6 +523,7 @@ pub const Model = struct {
         // a chunk's compressed keys are its stream's (to the context); the caches hold every stream's extent (the pool)
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, caps[0], m.context_cap);
         if (caps[1] > 0) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, caps[1], m.context_cap);
+        if (m.ch2) |*c2| c2.reap_bank = 1;
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try blas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
@@ -590,12 +597,29 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, m.unitCap());
         m.vocab = sp.world * (if (gpu.features.world4) (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n) else m.w.head.n); // 2D: both pairs' parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (reap.statsOn()) {
+            if (gpu.backend != .hip) return error.MissingKernel;
+            const bound = (try hip_load.reap(m.kit)) orelse return error.MissingKernel;
+            m.reap = try reap_dev.open(gpa, io, d, &m.eng, .{ .pack = bound.pack, .ssq = bound.ssq, .route = bound.route, .norm = bound.norm });
+            errdefer {
+                reap_dev.close(m.reap.?);
+                m.reap = null;
+            }
+            m.eng.reap = m.reap;
+            m.eng.reap_picks = reap_dev.picksOf;
+            m.eng.reap_down_y = reap_dev.downYOf;
+            m.eng.reap_note = reap_dev.noteLayer;
+        }
         return m;
     }
 
     pub fn close(m: *Model) void {
         m.joinAhead();
         m.stream.synchronize() catch {};
+        if (m.reap) |st| {
+            reap_dev.close(st);
+            m.reap = null;
+        }
         if (m.img_buf) |*b| b.free();
         if (m.window_l) |*b| b.free();
         if (m.window_g) |*b| b.free();
@@ -667,6 +691,10 @@ pub const Model = struct {
         // rank caches) and serve.conf's hash, each a 16-hex prefix; the KV caches' formats; strict mode
         const strict = if (gpu.backend == .hip) m.kit.strict else false;
         var ob: [128]u8 = undefined;
+        var reap_buf: [32]u8 = undefined;
+        var rcfg = reap.fromEnv(std.heap.page_allocator) catch reap.Config{};
+        defer rcfg.deinit(std.heap.page_allocator);
+        const reap_s = reap.planSuffix(&reap_buf, rcfg);
         id.plan = try planText(buf, .{
             .drafts = o.drafts,
             .engram = m.cfg.engram_layers.slice().len > 0,
@@ -687,6 +715,7 @@ pub const Model = struct {
             .edit = m.edit_id,
             .zip2 = m.zip2,
             .image_rows = if (o.modalities == .text_image) o.image_rows else image_rows_reserved,
+            .reap = reap_s,
         });
         return id;
     }
@@ -715,6 +744,8 @@ pub const Model = struct {
         // text_image: the image rows each rank reserved, " image_rows=N" at the end only when not the default (a rank
         // with fewer would end the pair at the first request between the two; the text is the stock one by default)
         image_rows: usize = Model.image_rows_reserved,
+        /// " reap=EVERY/PREFILL/BUCKETS" when REAP stats are on, else "". Peers that differ are refused.
+        reap: []const u8 = "",
     };
 
     /// The handshake's plan text (identity), in `buf`.
@@ -725,11 +756,11 @@ pub const Model = struct {
         const zip = if (p.zip2 > 0) try std.fmt.bufPrint(&zb, " prefill_zip2={d} unit_caps={d}/{d}", .{ p.zip2, chunk_rows, chunk_rows }) else "";
         var ib: [32]u8 = undefined;
         const img = if (p.image_rows != Model.image_rows_reserved) try std.fmt.bufPrint(&ib, " image_rows={d}", .{p.image_rows}) else "";
-        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}{s}{s}", .{
+        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}{s}{s}{s}", .{
             p.drafts,       p.engram,                      p.graphs,                             p.pool,        ctx,      p.streams, p.round_rows, chunk_rows,
             p.replay_floor, p.aux,                         p.gather,                             p.engram_rows, p.deploy, p.bundle,  p.conf,       kv_format,
             p.strict,       if (p.disk) " disk=1" else "", if (p.edit.len > 0) " edit=" else "", p.edit,        zip,
-            img,
+            img,            p.reap,
         });
     }
 
@@ -1063,6 +1094,7 @@ pub const Model = struct {
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+        try m.reapBegin(ch);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
@@ -1091,6 +1123,7 @@ pub const Model = struct {
         for (0..c.layers) |li| {
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
+                    try m.reapFinish(ch, li);
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits
                     if (pt) |t| {
@@ -1146,6 +1179,7 @@ pub const Model = struct {
             if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
         }
+        try m.reapFinish(ch, c.layers);
         try m.dumpWindow(ch, seq);
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
@@ -1208,7 +1242,9 @@ pub const Model = struct {
         hs[1].spans = hs[0].spans;
         hs[1].img_rows = hs[0].img_rows;
         try prompt.begin(e, hs[0], m.ids64[0..s], start, m.host_pos[0..s]);
+        try m.reapBegin(hs[0]);
         try prompt.begin(e, hs[1], m.ids64[s..n], start + s, m.host_pos[s..n]);
+        try m.reapBegin(hs[1]);
         for (hs) |ch| if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         var sh: [2]prompt.Shared = .{ .{}, .{} };
         const taps = m.dr != null;
@@ -1323,6 +1359,7 @@ pub const Model = struct {
         const a_past = try prompt.replayCut(e, hs[0], &m.view, &sh[0], cut, replay, m.host_pos);
         if (pend) |q| try e.comm.gatherEnd(q, e.s);
         if (a_past) return error.SplitPastReplay;
+        try m.reapFinish(hs[0], cut);
         // zip2: the cut layer's stores as the first chunk's replayCut left them, and the decoder layers' state the
         // first chunk never touched, before the second chunk's cut and decoder write them
         if (unit) {
@@ -1331,7 +1368,10 @@ pub const Model = struct {
             m.mid_slot = m.fill_slot;
         }
         const ch = hs[1];
-        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos)) return false;
+        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos)) {
+            try m.reapFinish(hs[1], cut);
+            return false;
+        }
         for (cut..c.layers) |li| {
             try prompt.attnMixes(e, ch, li);
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j); // (after the mixes, U52)
@@ -1342,6 +1382,7 @@ pub const Model = struct {
             try prompt.gather(e, ch, ch.moeOut(e), ch.gm, .at(.prompt_moe, li));
             prompt.endLayer(ch);
         }
+        try m.reapFinish(ch, c.layers);
         try m.dumpWindow(ch, seq);
         try prompt.head(e, ch);
         // the prompt's logits where promptLogits reads them
@@ -1376,7 +1417,9 @@ pub const Model = struct {
         hs[1].spans = hs[0].spans;
         hs[1].img_rows = hs[0].img_rows;
         try prompt.begin(e, hs[0], m.ids64[0..s], start, m.host_pos[0..s]);
+        try m.reapBegin(hs[0]);
         try prompt.begin(e, hs[1], m.ids64[s..n], start + s, m.host_pos[s..n]);
+        try m.reapBegin(hs[1]);
         for (hs) |ch| if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         var sh: [2]prompt.Shared = .{ .{}, .{} };
         const taps = m.dr != null;
@@ -1452,13 +1495,17 @@ pub const Model = struct {
         const a_past = try prompt.replayCut(e, hs[0], &m.view, &sh[0], cut, replay, m.host_pos);
         try Q.close(t, e, &pend);
         if (a_past) return error.SplitPastReplay;
+        try m.reapFinish(hs[0], cut);
         if (unit) {
             for (cut..c.layers) |li| try m.midSave(li);
             m.mid_at = start + s;
             m.mid_slot = m.fill_slot;
         }
         const ch = hs[1];
-        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos)) return false;
+        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos)) {
+            try m.reapFinish(hs[1], cut);
+            return false;
+        }
         for (cut..c.layers) |li| {
             try prompt.attnMixes(e, ch, li);
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
@@ -1469,6 +1516,7 @@ pub const Model = struct {
             try prompt.gather(e, ch, ch.moeOut(e), ch.gm, .at(.prompt_moe, li));
             prompt.endLayer(ch);
         }
+        try m.reapFinish(ch, c.layers);
         try m.dumpWindow(ch, seq);
         try prompt.head(e, ch);
         // 2D head_g is both pairs' columns (m.vocab); TP2's copy is world * this rank's head.n
@@ -1531,6 +1579,43 @@ pub const Model = struct {
         return m.ch.head_g;
     }
 
+    fn reapBegin(m: *Model, ch: *prompt.Chunk) !void {
+        const st = m.reap orelse return;
+        try reap_dev.beginPrompt(st, ch);
+    }
+
+    fn reapFinish(m: *Model, ch: *prompt.Chunk, layers_ran: usize) !void {
+        const st = m.reap orelse return;
+        try reap_dev.finishPrompt(st, ch, @intCast(layers_ran));
+    }
+
+    /// Sampled-row norms for this round, on every rank (the exchange). Routing counts wait until the draws.
+    fn reapAfterDecode(m: *Model, rows: round.Rows) !void {
+        const st = m.reap orelse return;
+        var buckets: [round.max_rows]u8 = @splat(0);
+        const n = @min(rows.ids.len, buckets.len);
+        if (rows.windows) |wins| {
+            for (wins) |w| {
+                const b: u8 = @intCast(@min(w.reap_bucket, 255));
+                var j: usize = 0;
+                while (j < w.n and w.row + j < n) : (j += 1) buckets[w.row + j] = b;
+            }
+        }
+        try reap_dev.afterDecode(st, buckets[0..n]);
+    }
+
+    /// Rank 0, before a prompt's chunks. `domain` is the domain index (text is index * 2).
+    pub fn setReapDomain(m: *Model, domain: u32) void {
+        const st = m.reap orelse return;
+        reap_dev.setDomain(st, domain);
+    }
+
+    /// Rank 0, after the round's draws. A failure is the caller's to log: the follower does not run this.
+    pub fn noteReapDecode(m: *Model, commit: []const u8, buckets: []const u8, pos: []const i32) !void {
+        const st = m.reap orelse return;
+        try reap_dev.noteDecodeRoute(st, commit, buckets, pos);
+    }
+
     /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then each window
     /// whose stream drafts has its rows' taps absorbed into its slot's drafter rings at its positions (the served
     /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
@@ -1540,6 +1625,7 @@ pub const Model = struct {
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.context_cap, null, if (m.graphs) |*g| g else null);
+        try m.reapAfterDecode(rows);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
@@ -1861,5 +1947,10 @@ test "the handshake's plan text is the stock one with sf-disk off, and says disk
     p.edit = "";
     p.zip2 = 1;
     try std.testing.expectEqualStrings(stock ++ " prefill_zip2=1 unit_caps=2048/2048", try Model.planText(&buf, p));
+    p.zip2 = 0;
+    p.reap = " reap=8/4/16";
+    try std.testing.expectEqualStrings(stock ++ " reap=8/4/16", try Model.planText(&buf, p));
+    p.reap = "";
+    try std.testing.expectEqualStrings(stock, try Model.planText(&buf, p));
     try std.testing.expect(!@hasField(Options, "disk") or (Options{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 0, .world = 2, .master = .{ 0, 0, 0, 0 }, .port = 0 }).disk == false);
 }

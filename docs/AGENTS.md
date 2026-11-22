@@ -80,7 +80,8 @@ Thinking is off in the shipped configuration (`THINKING=0` in
 [`tools/dsv41-hip/serve.conf`](../tools/dsv41-hip/serve.conf)). With it on, a separate loop can show up in very long
 reasoning (over about 25K tokens of thinking): the model repeats the same stretch of tokens inside its thinking.
 
-serve.conf turns on the server's `--loop-guard` (`LOOP_GUARD=1`, the default; `0` turns it off). It watches the thinking
-for one exact cycle of up to 64 tokens repeated for 256 tokens, then closes the thinking, and the reply goes on. The
-same check catches thinking that repeats one short line exactly for that long, such as identical table rows. The details
-are in [api.md](api.md#reasoning).
+serve.conf sets the server's `--loop-policy` (`LOOP_POLICY=stop`). It watches the thinking for one exact cycle of up to
+64 tokens repeated for 256 tokens, then ends the reply with `finish_reason: "loop"` (`close` closes the thinking and the
+reply goes on, as the old `LOOP_GUARD=1`; `count` only reports). Every reply reports what it found in `tensorfold.loop`,
+and loops in the answer are counted too, never acted on. The same check catches thinking that repeats one short line
+exactly for that long, such as identical table rows. The details are in [api.md](api.md#reasoning).

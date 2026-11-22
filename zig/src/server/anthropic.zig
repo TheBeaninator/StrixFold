@@ -77,7 +77,10 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             .ok => |v| v,
             .err => |m| return sendError(conn, a, m, 400),
         };
-        const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+        var chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+        if (srv.config.reap_stats) if (body.get("reap_domain")) |v| {
+            if (chat == .object) chat.object.put(a, "reap_domain", v) catch return sendError(conn, a, "out of memory", 500);
+        };
         if (count) {
             const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
             const o = json.newObject(a) catch return;
@@ -149,6 +152,10 @@ const Reply = struct {
     active: ?i64 = null,
     finished: bool = false,
     finish: []const u8 = "end_turn",
+    /// The chat reply ended with finish_reason "loop" (LOOP_POLICY=stop): see loopDetails.
+    looped: bool = false,
+    /// The chat reply's tensorfold block (tensorfold.loop among it), passed through as a top-level `tensorfold`.
+    tensorfold: Value = .null,
     stop_sequence: Value = .null,
     tokens: Value = .null,
     problem: ?[]const u8 = null,
@@ -239,9 +246,11 @@ const Reply = struct {
             const d = json.newObject(r.a) catch return error.Closed;
             try r.put(d, "stop_reason", .{ .string = r.finish });
             try r.put(d, "stop_sequence", r.stop_sequence);
+            if (r.looped) try r.put(d, "stop_details", loopDetails(r.a, r.tensorfold) catch return error.Closed);
             const o = try r.obj("message_delta");
             try r.put(o, "delta", .{ .object = d });
             try r.put(o, "usage", r.tokens);
+            if (r.tensorfold != .null) try r.put(o, "tensorfold", r.tensorfold);
             try r.send("message_delta", o);
             try r.send("message_stop", try r.obj("message_stop"));
             r.finished = true;
@@ -264,9 +273,13 @@ const Reply = struct {
         if (p.get("stop_sequence")) |s| if (s != .null) {
             r.stop_sequence = s;
         };
+        if (p.get("tensorfold")) |t| if (t == .object) {
+            r.tensorfold = t;
+        };
         if (p.get("choices")) |choices| if (choices == .array) for (choices.array) |choice| {
             if (choice.get("finish_reason")) |f| if (f.truthy()) {
                 r.finish = finishOf(json.strOr(f));
+                r.looped = std.mem.eql(u8, json.strOr(f), "loop");
             };
             if (r.stop_sequence != .null) r.finish = "stop_sequence";
             const delta = choice.get("delta") orelse Value.null;
@@ -376,10 +389,30 @@ const Reply = struct {
         try out.put(a, "usage", try usage(a, data.get("usage") orelse .null));
         const stop = data.get("stop_sequence") orelse Value.null;
         try out.put(a, "stop_sequence", stop);
-        try out.put(a, "stop_reason", .{ .string = if (stop != .null) "stop_sequence" else finishOf(json.strOr(choice.get("finish_reason"))) });
+        const finish = json.strOr(choice.get("finish_reason"));
+        try out.put(a, "stop_reason", .{ .string = if (stop != .null) "stop_sequence" else finishOf(finish) });
+        const tensorfold = data.get("tensorfold") orelse Value.null;
+        if (std.mem.eql(u8, finish, "loop")) try out.put(a, "stop_details", try loopDetails(a, tensorfold));
+        if (tensorfold == .object) try out.put(a, "tensorfold", tensorfold);
         return .{ .object = out };
     }
 };
+
+/// A reply the loop policy stopped (chat finish_reason "loop") as Messages. Anthropic's stop_reason is a closed set
+/// (end_turn, max_tokens, stop_sequence, tool_use, pause_turn, refusal) and none says "the server cut a thinking loop":
+/// max_tokens would make a client retry with a bigger limit, refusal is wrong, and a new value would break clients that
+/// switch on the set. So stop_reason stays "end_turn" (the model produced no further turn) and the reply adds
+/// `stop_details` {type: "loop", period, at_token, in} (the first loop found, from tensorfold.loop) plus the whole
+/// top-level `tensorfold` block. A client that cares reads stop_details; one that does not sees an ordinary end_turn.
+fn loopDetails(a: Allocator, tensorfold: Value) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try o.put(a, "type", .{ .string = "loop" });
+    const found = if (tensorfold == .object) tensorfold.get("loop") else null;
+    for ([_][]const u8{ "period", "at_token", "in" }) |key| {
+        try o.put(a, key, if (found) |l| (l.get(key) orelse Value.null) else Value.null);
+    }
+    return .{ .object = o };
+}
 
 fn finishOf(reason: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "tool_calls")) return "tool_use";

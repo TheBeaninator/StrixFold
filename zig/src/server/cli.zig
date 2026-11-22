@@ -54,6 +54,7 @@ pub const flags = [_]Flag{
     .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh" }, .native = true },
     .{ .name = "--thinking-budget", .native = true },
     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
+    .{ .name = "--loop-policy", .choices = &.{ "off", "close", "stop", "count" }, .native = true },
     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
     .{ .name = "--keep-warm", .native = true },
     .{ .name = "--compact-at", .native = true },
@@ -130,7 +131,8 @@ pub const Args = struct {
     thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
-    loop_guard: bool = false,
+    loop_guard: bool = false, // --loop-guard: the old name of --loop-policy close
+    loop_policy: ?api.LoopPolicy = null,
     no_drafts: bool = false,
     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
     compact_auto: bool = false,
@@ -142,6 +144,11 @@ pub const Args = struct {
     device: ?u32 = null,
     segments: ?u32 = null,
 };
+
+/// --loop-policy, else close for --loop-guard, else off.
+pub fn loopPolicy(args: Args) api.LoopPolicy {
+    return args.loop_policy orelse if (args.loop_guard) .close else .off;
+}
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
 pub const Usage = struct { message: []const u8 = "" };
@@ -240,7 +247,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const n = try int(u, a, name, v);
         if (n < 1) return fail(u, a, "argument --vision-max-images: expected an image count from 1: '{s}'", .{v});
         out.vision_max_images = std.math.cast(u32, n) orelse std.math.maxInt(u32);
-    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--draft-temperature")) out.draft_temperature = try draftTemperature(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--draft-temperature")) out.draft_temperature = try draftTemperature(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--loop-policy")) out.loop_policy = api.LoopPolicy.parse(v).? else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
             const f = try float(u, a, name, v);
             if (!(f > 0 and f <= 1)) return fail(u, a, "argument --compact-at: expected auto or a fraction in (0, 1]: '{s}'", .{v});
@@ -328,6 +335,11 @@ test "parse and capabilities share the table" {
     try std.testing.expect(!args.thinking);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter", "x" }, &u));
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
+    try std.testing.expectEqual(api.LoopPolicy.off, loopPolicy(try parse(a, &.{"m"}, &u)));
+    try std.testing.expectEqual(api.LoopPolicy.close, loopPolicy(try parse(a, &.{ "m", "--loop-guard" }, &u)));
+    try std.testing.expectEqual(api.LoopPolicy.stop, loopPolicy(try parse(a, &.{ "m", "--loop-policy", "stop" }, &u)));
+    try std.testing.expectEqual(api.LoopPolicy.count, loopPolicy(try parse(a, &.{ "m", "--loop-guard", "--loop-policy=count" }, &u)));
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--loop-policy", "guard" }, &u));
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
     try std.testing.expect(!(try parse(a, &.{ "m", "--prompt-cache-gib", "16" }, &u)).prompt_cache_over_cap);

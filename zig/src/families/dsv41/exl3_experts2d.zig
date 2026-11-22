@@ -9,6 +9,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const weights = @import("weights.zig");
 const X = @import("exl3_experts.zig");
+const reap = @import("reap.zig");
 
 fn launch(f: gpu.Function, s: gpu.Stream, grid: [3]usize, block: usize, args: *gpu.Args) !void {
     try gpu.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block) } }, s, args);
@@ -277,7 +278,8 @@ pub fn downLaunch(ex: weights.Experts, sc: X.DecodeScratch, xd_full: u64, pick: 
     var dn: gpu.Args = .{};
     for ([_]u64{ xd_full, xd_full, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
     for ([_]usize{ w.i, w.dn, w.p, 1, r, w.slots }) |v| i32a(&dn, v);
-    dn.add(X.DecodeEpi{ .pick = pick, .E = @intCast(w.e), .svh_d = ex.svh_d, .y = sc.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .discard = @intFromBool(4 * w.slots <= 32) });
+    const dy = reap.downY(sc.y, sc.reap_y, w.slots);
+    dn.add(X.DecodeEpi{ .pick = pick, .E = @intCast(w.e), .svh_d = ex.svh_d, .y = dy.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .discard = dy.discard });
     return .{ .kernel = .down, .range = X.range(ex.k2_d[0], ex.k2_d[1]), .cfg = .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(w.dn / 128), .z = @intCast(w.mt) }, .block = .{ .x = 4 * 32 }, .pdl = gpu.features.pdl }, .args = dn };
 }
 
@@ -345,4 +347,32 @@ test "a 2D node's decode scratch and windows" {
     try std.testing.expectError(error.UnsupportedShape, downLaunch(ex, sc, 0, 0, 0, 0, 1));
     ex.width = 1280;
     try std.testing.expectError(error.UnsupportedShape, downLaunch(ex, sc, 0, 0, 0, 0, 1));
+}
+
+test "reap down y redirect on a 2D node changes only the down epilogue" {
+    const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 640, .down_k = 1152, .down_n = 2560, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
+    const sc: X.DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 1, .xu = 2, .xd = 3, .z = 4, .y = 0x1000, .cnt_gu = 5, .cnt_d = 6, .epoch = 7, .ready = 8, .ready_cnt = 9, .ids = 10, .count = 11, .members = 12 };
+    var r: usize = 1;
+    while (r <= 8) : (r += 1) {
+        const gu0 = try gateUpLaunches(ex, sc, 0x20, 5120, 0x30, 0x40, 0x50, r, 10);
+        const dn0 = try downLaunch(ex, sc, 0x60, 0x30, 0x40, 0x50, r);
+        var on_sc = sc;
+        on_sc.reap_y = 0xABC0;
+        const gu1 = try gateUpLaunches(ex, on_sc, 0x20, 5120, 0x30, 0x40, 0x50, r, 10);
+        const dn1 = try downLaunch(ex, on_sc, 0x60, 0x30, 0x40, 0x50, r);
+        try std.testing.expectEqualSlices(u8, gu0[0].args.storage[0..gu0[0].args.used], gu1[0].args.storage[0..gu1[0].args.used]);
+        try std.testing.expectEqualSlices(u8, gu0[1].args.storage[0..gu0[1].args.used], gu1[1].args.storage[0..gu1[1].args.used]);
+        const epi = dn1.args.offsets[dn1.args.count - 1];
+        var a = dn0.args;
+        var b = dn1.args;
+        @memset(a.storage[epi + @offsetOf(X.DecodeEpi, "y") ..][0..8], 0);
+        @memset(b.storage[epi + @offsetOf(X.DecodeEpi, "y") ..][0..8], 0);
+        @memset(a.storage[epi + @offsetOf(X.DecodeEpi, "discard") ..][0..4], 0);
+        @memset(b.storage[epi + @offsetOf(X.DecodeEpi, "discard") ..][0..4], 0);
+        try std.testing.expectEqualSlices(u8, a.storage[0..a.used], b.storage[0..b.used]);
+        const y = std.mem.readInt(u64, dn1.args.storage[epi + @offsetOf(X.DecodeEpi, "y") ..][0..8], .little);
+        const disc = std.mem.readInt(u32, dn1.args.storage[epi + @offsetOf(X.DecodeEpi, "discard") ..][0..4], .little);
+        try std.testing.expectEqual(@as(u64, 0xABC0), y);
+        try std.testing.expectEqual(@as(u32, 0), disc);
+    }
 }

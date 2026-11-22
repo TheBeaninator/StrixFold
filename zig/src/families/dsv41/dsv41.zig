@@ -112,6 +112,8 @@ test {
     refAll(sampling);
     refAll(model);
     refAll(lanes);
+    refAll(@import("reap.zig"));
+    refAll(@import("reap_dev.zig"));
     refAll(stop_marker);
     refAll(coll);
     refAll(fan);

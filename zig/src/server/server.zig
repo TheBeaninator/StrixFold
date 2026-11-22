@@ -42,7 +42,8 @@ pub const Config = struct {
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
-    loop_guard: bool = false,
+    /// --loop-policy (--loop-guard: close): what a short exact token cycle does to a reply (api.LoopPolicy).
+    loop_policy: api.LoopPolicy = .off,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
     dashboard: bool = false,
@@ -61,6 +62,8 @@ pub const Config = struct {
     timeouts: http_conn.Timeouts = .{},
     /// --cache-transfer-key: what signs an export and admits the /cache routes; null: those routes are absent (404).
     transfer: ?cache_key.Key = null,
+    /// TF_DS_REAP_STATS=1: GET /stats/reap (still 404 without `transfer`). Off: the route is absent.
+    reap_stats: bool = false,
     /// The queue cap (queue_cap.zig); null: TF_QUEUE_MAX, TF_QUEUE_MIB and TF_QUEUE_RETRY_S, else their defaults.
     queue: ?queue_cap.Limits = null,
 };
@@ -100,7 +103,7 @@ pub const Server = struct {
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa, .loop_policy = config.loop_policy }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});

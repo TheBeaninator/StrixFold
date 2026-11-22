@@ -82,7 +82,7 @@ const GuardCase = struct {
     max_new: u32 = 400,
     drafts: bool = true,
     think_budget: u32 = 0,
-    loop_guard: bool = true,
+    policy: sm.LoopPolicy = .close,
     think_open: ?bool = null,
     cycle_after: usize = 70,
     pattern: []const u32 = &.{ 11, 12, 13 },
@@ -94,6 +94,8 @@ const GuardOut = struct {
     reason: sm.Reason,
     period: ?u32,
     finished: bool,
+    loop: ?sm.LoopHit,
+    answer_loop: ?sm.LoopHit,
 };
 
 fn runGuard(cases: []const GuardCase, step_limit: usize) ![]GuardOut {
@@ -111,7 +113,7 @@ fn runGuard(cases: []const GuardCase, step_limit: usize) ![]GuardOut {
     defer gpa.free(proposers);
     for (cases, streams, proposers) |item, *s, *p| {
         p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
-        s.* = try sm.Stream.init(gpa, .{ .id = "guard", .prompt = item.prompt, .max_new = item.max_new, .eos = &.{96}, .drafts = item.drafts, .proposer = p.proposer(), .think_budget = item.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_open = item.think_open, .loop_guard = item.loop_guard });
+        s.* = try sm.Stream.init(gpa, .{ .id = "guard", .prompt = item.prompt, .max_new = item.max_new, .eos = &.{96}, .drafts = item.drafts, .proposer = p.proposer(), .think_budget = item.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_open = item.think_open, .loop_policy = item.policy });
     }
     defer for (streams, proposers) |*s, *p| {
         s.deinit(gpa);
@@ -121,7 +123,7 @@ fn runGuard(cases: []const GuardCase, step_limit: usize) ![]GuardOut {
     var steps: usize = 0;
     while (engine.activeCount() > 0 and steps < step_limit) : (steps += 1) try engine.step();
     const out = try gpa.alloc(GuardOut, cases.len);
-    for (out, streams) |*result, *s| result.* = .{ .emitted = try gpa.dupe(u32, s.emitted()), .reason = s.reason, .period = s.loop_period, .finished = s.finished };
+    for (out, streams) |*result, *s| result.* = .{ .emitted = try gpa.dupe(u32, s.emitted()), .reason = s.reason, .period = if (s.loop) |h| h.period else null, .finished = s.finished, .loop = s.loop, .answer_loop = s.answer_loop };
     return out;
 }
 
@@ -347,7 +349,7 @@ test "the loop guard matches drafted and plain, reports its period, and answers 
     try std.testing.expect(plain[0].finished and plain[0].reason == .stop);
     try std.testing.expectEqualSlices(u32, &.{ 90, 91, 92, 40, 41, 42, 96 }, plain[0].emitted[329..]);
 
-    const off = try runGuard(&.{.{ .prompt = &p2, .loop_guard = false, .think_open = true }}, 5000);
+    const off = try runGuard(&.{.{ .prompt = &p2, .policy = .off, .think_open = true }}, 5000);
     defer freeGuard(off);
     try std.testing.expect(off[0].finished and off[0].reason == .length and off[0].emitted.len == 400);
 }
@@ -363,6 +365,55 @@ test "a cycle in the answer does not refire or reclose" {
     var close_count: usize = 0;
     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
     try std.testing.expectEqual(@as(usize, 1), close_count);
+    // the answer's cycle is counted (never acted on): the answer starts at 331 (the 92 after 90 91), its 21 22 23 cycle
+    // at answer index 1, and the run completes at answer index 64 + 3 + 256 - 1 = 322
+    try std.testing.expectEqual(sm.LoopHit{ .period = 3, .at_token = 328 }, plain[0].loop.?);
+    try std.testing.expectEqual(sm.LoopHit{ .period = 3, .at_token = 331 + 322 }, plain[0].answer_loop.?);
+    try std.testing.expectEqual(plain[0].answer_loop.?, drafted[0].answer_loop.?);
+}
+
+test "loop policy stop ends at detection with reason loop, drafted or plain, and never answers" {
+    const plain = try runGuard(&.{.{ .prompt = &p2, .drafts = false, .policy = .stop }}, 5000);
+    defer freeGuard(plain);
+    const drafted = try runGuard(&.{.{ .prompt = &p2, .policy = .stop }}, 5000);
+    defer freeGuard(drafted);
+    for ([_]GuardOut{ plain[0], drafted[0] }) |r| {
+        try std.testing.expect(r.finished and r.reason == .loop);
+        try std.testing.expectEqual(sm.LoopHit{ .period = 3, .at_token = 328 }, r.loop.?);
+        try std.testing.expectEqual(@as(usize, 329), r.emitted.len); // nothing past the firing token
+        try std.testing.expect(std.mem.indexOfScalar(u32, r.emitted, 90) == null); // no forced close
+    }
+    // close's reply up to the firing token is the same tokens
+    const closed = try runGuard(&.{.{ .prompt = &p2, .drafts = false }}, 5000);
+    defer freeGuard(closed);
+    try std.testing.expectEqualSlices(u32, closed[0].emitted[0..329], plain[0].emitted);
+}
+
+test "loop policy count leaves the token stream identical to policy off and records the loop" {
+    for ([_]bool{ false, true }) |drafts| {
+        const off = try runGuard(&.{.{ .prompt = &p2, .drafts = drafts, .policy = .off, .think_open = true }}, 5000);
+        defer freeGuard(off);
+        const counted = try runGuard(&.{.{ .prompt = &p2, .drafts = drafts, .policy = .count }}, 5000);
+        defer freeGuard(counted);
+        try std.testing.expectEqualSlices(u32, off[0].emitted, counted[0].emitted);
+        try std.testing.expectEqual(off[0].reason, counted[0].reason);
+        try std.testing.expect(counted[0].finished and counted[0].reason == .length and counted[0].emitted.len == 400);
+        try std.testing.expect(off[0].loop == null and off[0].answer_loop == null);
+        try std.testing.expectEqual(sm.LoopHit{ .period = 3, .at_token = 328 }, counted[0].loop.?);
+        try std.testing.expect(counted[0].answer_loop == null); // thinking never closed: no answer
+    }
+}
+
+test "with thinking off a looping reply is counted as an answer loop under every policy, never acted on" {
+    const off = try runGuard(&.{.{ .prompt = &p2, .drafts = false, .policy = .off, .think_open = false }}, 5000);
+    defer freeGuard(off);
+    for ([_]sm.LoopPolicy{ .close, .stop, .count }) |policy| {
+        const r = try runGuard(&.{.{ .prompt = &p2, .drafts = false, .policy = policy, .think_open = false }}, 5000);
+        defer freeGuard(r);
+        try std.testing.expectEqualSlices(u32, off[0].emitted, r[0].emitted);
+        try std.testing.expect(r[0].reason == .length and r[0].loop == null);
+        try std.testing.expectEqual(sm.LoopHit{ .period = 3, .at_token = 328 }, r[0].answer_loop.?);
+    }
 }
 
 /// The rule's learned overhead entries after one drafted request, with or without frozen timing.

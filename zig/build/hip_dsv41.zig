@@ -214,7 +214,7 @@ fn readelfNotes(b: *std.Build, o: Options, object: std.Build.LazyPath) std.Build
 }
 
 /// The dsv41 kit's HIP sources (registry.json, kit "dsv41") and their code objects' names.
-const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_mlp.hip", "exl3_mlp.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" }, .{ "aux_markov.hip", "aux_markov.hsaco" }, .{ "vision.hip", "vision.hsaco" } };
+const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_mlp.hip", "exl3_mlp.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" }, .{ "aux_markov.hip", "aux_markov.hsaco" }, .{ "vision.hip", "vision.hsaco" }, .{ "reap.hip", "reap.hsaco" } };
 
 /// The engine graph of a HIP server or its host tests: the shared tokenizer, core, lanes and engine API, the HIP `gpu`
 /// module, the dsv41 family over them, and native/hip.zig (the engine host) as `native_engines`.
@@ -307,7 +307,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // the family on HIP: its serving path analyzed from native.open, its files' host tests, the CPU root's tests
     const hip_gpu_host = gpuModule(b, host, .Debug, o);
     const hip_lanes_host = lanesModule(b, host, .Debug);
-    host_test.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = familyModule(b, host, .Debug, o, hip_gpu_host, hip_lanes_host, "zig/src/families/dsv41/hip_test.zig") })).step);
+    const family_test = b.addTest(.{ .root_module = familyModule(b, host, .Debug, o, hip_gpu_host, hip_lanes_host, "zig/src/families/dsv41/hip_test.zig") });
+    host_test.dependOn(&b.addRunArtifact(family_test).step);
+    // compile the family without running it (laptop: loopback tests hang; hipcc is not this step)
+    const family_compile = b.step("test-dsv41-family-compile", "compile the dsv41 HIP family host tests (no run, no hipcc)");
+    family_compile.dependOn(&family_test.step);
     // the layer gate's own tests (its fixture reads, checks and dump around the replay cut; no GPU work)
     host_test.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/families/dsv41/layer_main.zig"),

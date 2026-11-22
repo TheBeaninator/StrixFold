@@ -72,11 +72,18 @@ pub const Request = struct {
     /// Set only when ``Info`` says the engine enforces it.
     call: ?CallGate = null,
     structure: ?Structure = null,
-    /// Stop a short exact cycle while the think block is open.
-    loop_guard: bool = false,
+    /// What a short exact cycle does (lanes LoopPolicy): off, close the think block, stop the reply, or only count it.
+    loop_policy: LoopPolicy = .off,
+    /// Edge-REAP domain index (0: "default"). Set by the server before the stream is built.
+    reap_bucket: u32 = 0,
 };
 
-pub const Reason = enum { stop, length, cancelled, failed };
+/// The loop policy and what it found (lanes/stream.zig).
+pub const LoopPolicy = lanes.stream.LoopPolicy;
+pub const LoopHit = lanes.stream.LoopHit;
+
+/// `loop`: the loop policy `stop` ended the reply at a thinking loop.
+pub const Reason = enum { stop, length, cancelled, failed, loop };
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
 pub const Stats = struct {
@@ -87,8 +94,9 @@ pub const Stats = struct {
     min_rows: u32 = 0,
     prefill_widths: []const u32 = &.{},
     prefill_raised: []const bool = &.{},
-    /// The loop period that ended or interrupted the think block, if any.
-    loop_period: ?u32 = null,
+    /// The thinking loop the request's loop policy found (acted on or not), and a loop in the answer (counted only).
+    loop: ?LoopHit = null,
+    answer_loop: ?LoopHit = null,
     /// Prompt prefill duration measured by the engine host, in seconds.
     prefill_seconds: ?f64 = null,
     /// The drafter's own counters as a JSON object, or empty.
@@ -122,7 +130,7 @@ pub const Info = struct {
     context_fitted: bool = false,
     /// What the engine enforces; the server refuses requests that need more.
     call_gates: bool = false,
-    /// The engine observes loop_guard requests in its lane stream.
+    /// The engine observes a request's loop_policy in its lane stream.
     loop_guard: bool = false,
     structures: bool = false,
     /// The largest top_k the engine's sampler draws (0: no limit), and whether a sampled request must set one (its
@@ -229,6 +237,16 @@ pub const CacheOp = struct {
 /// What an engine's kept states look like on the wire (prompt_cache's Store.shape).
 pub const CacheShape = cache_wire.Shape;
 
+/// GET /stats/reap. The engine fills `out` (allocator-owned) and `status`.
+/// `domain` empty lists buckets. `modality` empty means both modalities merged.
+pub const ReapQuery = struct {
+    domain: []const u8 = "",
+    modality: []const u8 = "",
+    allocator: Allocator,
+    out: ?[]u8 = null,
+    status: u16 = 200,
+};
+
 pub const Engine = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -249,6 +267,10 @@ pub const Engine = struct {
         cache: ?*const fn (ctx: *anyopaque, op: *CacheOp) void = null,
         /// What this engine's kept states look like on the wire; null: it moves none (read from HTTP threads).
         cache_shape: ?*const fn (ctx: *anyopaque) ?CacheShape = null,
+        /// GET /stats/reap, on the HTTP thread. Null: the route answers an empty bucket list.
+        reap: ?*const fn (ctx: *anyopaque, q: *ReapQuery) void = null,
+        /// Admit a domain before generation. 0 and `index` on success; else the message length written into `err`.
+        reap_admit: ?*const fn (ctx: *anyopaque, domain: []const u8, index: *u32, err: []u8) usize = null,
     };
 
     pub fn info(e: Engine) Info {

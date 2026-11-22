@@ -22,6 +22,7 @@ pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const fake = @import("fake.zig");
 pub const grammar = @import("grammar/grammar.zig");
+pub const reap_hook = @import("reap_hook.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;

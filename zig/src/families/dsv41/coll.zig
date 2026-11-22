@@ -75,6 +75,8 @@ pub const Phase = enum(u16) {
     ring_setup, // CUDA: the RDMA rings' queue-pair infos and their start barrier
     two_parts, // world 4: prompt2d's parts
     two_pair, // world 4: prompt2d's pair exchanges
+    reap_pair, // REAP: the partner's per-slot partials (layer 40; phase4 saturates with reap_scalar)
+    reap_scalar, // REAP: the pair's column-half sums of squares (layer 41)
     test_only = 0xffff,
 };
 

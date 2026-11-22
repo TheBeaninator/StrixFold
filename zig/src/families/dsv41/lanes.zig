@@ -224,7 +224,7 @@ pub const Reader = struct {
 
 /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
 /// taps go into the drafter, its rows' ids.
-pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32 };
+pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, reap_bucket: u32 = 0 };
 
 /// The rows of a round (round.Rows' slices point here).
 pub const Built = struct {
@@ -258,7 +258,7 @@ pub const Built = struct {
                 b.bases[b.r + j] = @intCast(w.base);
                 b.ends[b.r + j] = @intCast(w.end);
             }
-            b.wins[i] = .{ .row = b.r, .n = w.ids.len, .seq = seq.items[0 .. w.start + w.ids.len] };
+            b.wins[i] = .{ .row = b.r, .n = w.ids.len, .seq = seq.items[0 .. w.start + w.ids.len], .reap_bucket = w.reap_bucket };
             b.absorb[i] = w.absorb;
             b.r += w.ids.len;
         }
@@ -946,6 +946,7 @@ pub const Lanes = struct {
             try fill_spans.write(&self.wire, gpa, if (keyed) s.cache_spans else &.{});
             try self.flush();
         }
+        if (m.rank == 0) m.setReapDomain(s.reap_bucket);
         try m.fillBegin(slot, base);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
@@ -1127,7 +1128,7 @@ pub const Lanes = struct {
             ids[k][0] = @intCast(w.pending);
             for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
-            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
+            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows], .reap_bucket = w.stream.reap_bucket * 2 };
         }
         const t0 = m.now();
         if (try self.begin(.verify)) {
@@ -1190,6 +1191,29 @@ pub const Lanes = struct {
                 }
                 std.debug.print("]}}\n", .{});
             } else if (trace_rounds == 1) std.debug.print("{{\"verify\": {d}, \"rows\": {d}, \"ids\": {any}, \"drawn\": {any}}}\n", .{ w.stream.cache_len, w.rows(), ids[k][0..w.rows()], o.sampled[0..w.rows()] });
+        }
+        if (m.rank == 0 and m.reap != null) {
+            var commit: [max_rows]u8 = @splat(0);
+            var buckets: [max_rows]u8 = @splat(0);
+            var pos: [max_rows]i32 = @splat(0);
+            const n = self.built.r;
+            for (windows, out, 0..) |w, o, k| {
+                const rows_n = w.rows();
+                const drawn = o.sampled[0..rows_n];
+                const idw = ids[k][0..rows_n];
+                var kept: usize = 0;
+                while (kept + 1 < rows_n and drawn[kept] == @as(u32, @intCast(idw[kept + 1]))) kept += 1;
+                const row0 = self.built.wins[k].row;
+                const b: u8 = @intCast(@min(wins[k].reap_bucket, 255));
+                for (0..rows_n) |r| {
+                    commit[row0 + r] = if (r <= kept) 1 else 0;
+                    buckets[row0 + r] = b;
+                    pos[row0 + r] = @intCast(self.built.pos[row0 + r]);
+                }
+            }
+            m.noteReapDecode(commit[0..n], buckets[0..n], pos[0..n]) catch |err| {
+                std.log.err("reap: decode routing note failed ({s})", .{@errorName(err)});
+            };
         }
     }
 

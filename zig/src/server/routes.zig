@@ -11,6 +11,7 @@ const tokens = @import("tokens.zig");
 const decisions = @import("decisions.zig");
 const status = @import("status_routes.zig");
 const cache = @import("cache_routes.zig");
+const reap = @import("reap_routes.zig");
 const queue_cap = @import("queue_cap.zig");
 const Server = @import("server.zig").Server;
 const Conn = http_conn.Conn;
@@ -43,6 +44,7 @@ fn get(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
+    if (std.mem.eql(u8, route, "/stats/reap") or std.mem.eql(u8, route, "/v1/stats/reap")) return reap.get(srv, conn, a);
     if (route.len == 0 or std.mem.eql(u8, route, "/health")) return status.health(srv, conn, a) catch {};
     if (std.mem.endsWith(u8, route, "/models")) return status.models(srv, conn, a) catch {};
     unknown(conn, a);

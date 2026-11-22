@@ -174,5 +174,58 @@ class PillowPath(unittest.TestCase):
             self.assertNotIn("TF_PIL_PATH", env)
 
 
+def resolve_policy(drop_policy=False, **keys):
+    """serve.conf with keys set over it (drop_policy: the conf's LOOP_POLICY removed, an old configuration), through
+    serve_loop_policy and rank 0's serve_cmd: (exit code, stderr, rank 0's argv)."""
+    sets = "; ".join(f"{k}={shlex.quote(v)}" for k, v in keys.items())
+    unset = "unset LOOP_POLICY; " if drop_policy else ""
+    script = (f"source {shlex.quote(str(HERE / 'serve_lib.sh'))}; source {shlex.quote(str(HERE / 'serve.conf'))}; {unset}{sets + '; ' if sets else ''}"
+              'RANK=0; BIN=/b; serve_loop_policy; serve_cmd; printf "%s\\n" "${SERVE_CMD[@]}"')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return r.returncode, r.stderr, r.stdout.splitlines()
+
+
+class LoopPolicy(unittest.TestCase):
+    """LOOP_POLICY: rank 0's --loop-policy; LOOP_GUARD is its old name for close."""
+
+    def test_serve_conf_default_is_stop(self):
+        rc, err, argv = resolve_policy()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(argv[argv.index("--loop-policy") + 1], "stop")
+        self.assertNotIn("--loop-guard", argv)
+
+    def test_count_and_stop_pass_the_flag(self):
+        for policy in ("stop", "count"):
+            rc, err, argv = resolve_policy(LOOP_POLICY=policy)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(argv[argv.index("--loop-policy") + 1], policy)
+
+    def test_close_is_the_old_loop_guard_argv(self):
+        rc, err, argv = resolve_policy(LOOP_POLICY="close")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--loop-guard", argv)
+        self.assertNotIn("--loop-policy", argv)
+
+    def test_an_old_conf_keeps_loop_guard(self):
+        for guard, flag in (("1", True), ("0", False)):
+            rc, err, argv = resolve_policy(drop_policy=True, LOOP_GUARD=guard)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual("--loop-guard" in argv, flag, guard)
+            self.assertNotIn("--loop-policy", argv)
+        rc, err, argv = resolve_policy(drop_policy=True)  # neither set: close, as LOOP_GUARD's default was
+        self.assertIn("--loop-guard", argv)
+
+    def test_off_passes_nothing(self):
+        rc, err, argv = resolve_policy(LOOP_POLICY="off")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("--loop-guard", argv)
+        self.assertNotIn("--loop-policy", argv)
+
+    def test_a_bad_policy_is_refused(self):
+        rc, err, _ = resolve_policy(LOOP_POLICY="guard")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("LOOP_POLICY must be", err)
+
+
 if __name__ == "__main__":
     unittest.main()

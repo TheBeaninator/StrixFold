@@ -16,6 +16,7 @@ const request_log = @import("request_log.zig");
 const sse = @import("sse.zig");
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
+const reap_routes = @import("reap_routes.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -139,6 +140,10 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Pla
     input.images = images.list.items;
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     input.token_ids = if (body.get("return_token_ids")) |v| v.truthy() else false;
+    if (srv.config.reap_stats) if (body.get("reap_domain")) |v| {
+        input.reap_domain = v.str() orelse return cx.refuse(reap_routes.invalid_domain);
+        input.reap_from_body = true;
+    };
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
     const first = body.get("max_tokens");
     const max = if (first != null and first.?.truthy()) first else body.get("max_completion_tokens");
@@ -226,6 +231,9 @@ pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw:
         return;
     };
     p.input.id = id;
+    if (srv.config.reap_stats and !p.input.reap_from_body) if (gone.conn.header("x-reap-domain")) |h| {
+        p.input.reap_domain = std.mem.trim(u8, h, " \t");
+    };
     var r: Run = .{ .srv = srv, .a = a, .out = out, .is_chat = is_chat, .plan = p, .id = id, .created = std.Io.Clock.real.now(srv.io).toSeconds() };
     if (p.stream) r.stream(gone, field) else r.whole(gone, field);
 }

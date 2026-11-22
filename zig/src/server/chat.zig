@@ -15,6 +15,7 @@ const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
 const queue_cap = @import("queue_cap.zig");
+const reap_routes = @import("reap_routes.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -36,6 +37,10 @@ pub const Input = struct {
     token_ids: bool = false,
     /// The image parts' bytes in prompt order (their placeholders in the messages' text), for an engine with vision.
     images: []const []const u8 = &.{},
+    /// Edge-REAP domain. Empty is "default". Ignored unless the server collects REAP stats.
+    reap_domain: []const u8 = "",
+    /// The body named reap_domain, including an empty string, so the header does not override it.
+    reap_from_body: bool = false,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -144,6 +149,14 @@ pub const Prepared = struct {
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
 pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
+    var reap_bucket: u32 = 0;
+    if (srv.config.reap_stats) {
+        const domain = if (input.reap_domain.len == 0) "default" else input.reap_domain;
+        if (!reap_routes.domainOk(domain)) return cx.refuse(reap_routes.invalid_domain);
+        var errbuf: [180]u8 = undefined;
+        const n = reap_routes.admit(srv, domain, &reap_bucket, &errbuf);
+        if (n != 0) return cx.refuse(try a.dupe(u8, errbuf[0..n]));
+    }
     const io = srv.io;
     const received = nowNs(io);
     const f = input.fields;
@@ -204,13 +217,15 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         // a cut just before the conversation's own text: fresh sessions resume their whole harness
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk),
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+        .reap_bucket = reap_bucket,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+    // every reply carries the policy: a thinking loop is acted on per the policy, an answer loop is only counted
+    request.loop_policy = srv.config.loop_policy;
     if (thinking) {
         const budget_field = f.get("thinking_budget");
         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
-        if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
-        if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
+        if ((budget > 0 or request.loop_policy != .off) and srv.think_close.len > 0) {
             if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
             request.think_close = srv.think_close;
             request.think_end = srv.think_close_end;
@@ -267,6 +282,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
+    defer srv.metrics.noteLoops(srv.io, box.stats.loop != null, box.stats.answer_loop != null);
     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -510,6 +526,7 @@ const Generation = struct {
             .stop => "stop",
             .length => "length",
             .cancelled => "cancelled",
+            .loop => "loop",
             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
         };
         const finished_ns = nowNs(g.srv.io);
@@ -585,11 +602,7 @@ const Generation = struct {
             try runtime.put(a, "token_ids", .{ .array = got });
         }
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
-        if (m.stats.loop_period) |period| {
-            const loop_field = try json.newObject(a);
-            try loop_field.put(a, "period", try json.intValue(a, period));
-            try runtime.put(a, "loop", .{ .object = loop_field });
-        }
+        if (try loopField(a, g.srv.config.loop_policy, m.stats)) |loop_field| try runtime.put(a, "loop", loop_field);
         const s = m.stats;
         const spec = try json.newObject(a);
         try spec.put(a, "rounds", try json.intValue(a, s.rounds));
@@ -621,11 +634,35 @@ const Generation = struct {
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
         var cycle_text: [32]u8 = undefined;
-        const cycle = if (s.loop_period) |period| std.fmt.bufPrint(&cycle_text, " loop=period:{d}", .{period}) catch "" else "";
-        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted });
+        const cycle = if (s.loop) |hit| std.fmt.bufPrint(&cycle_text, " loop=period:{d}", .{hit.period}) catch "" else "";
+        var answer_text: [40]u8 = undefined;
+        const answer_cycle = if (s.answer_loop) |hit| std.fmt.bufPrint(&answer_text, " answer_loop=period:{d}", .{hit.period}) catch "" else "";
+        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s}{s} rounds={d} accepted={d}/{d}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, answer_cycle, s.rounds, s.accepted, s.drafted });
         return reply;
     }
 };
+
+/// The reply's `tensorfold.loop`: {policy, fired, period, at_token, in}, the first loop found (`in` "thinking" or
+/// "answer"; period, at_token and in null when none fired), plus `answer` {period, at_token} when the answer looped
+/// after a thinking loop. at_token is the 0-based index of the completion token that completed the cycle's run.
+/// Null (no field) when the policy is off.
+pub fn loopField(a: Allocator, policy: api.LoopPolicy, stats: api.Stats) Allocator.Error!?Value {
+    if (policy == .off) return null;
+    const o = try json.newObject(a);
+    try o.put(a, "policy", .{ .string = @tagName(policy) });
+    const first: ?api.LoopHit = stats.loop orelse stats.answer_loop;
+    try o.put(a, "fired", .{ .bool = first != null });
+    try o.put(a, "period", if (first) |h| try json.intValue(a, h.period) else .null);
+    try o.put(a, "at_token", if (first) |h| try json.intValue(a, h.at_token) else .null);
+    try o.put(a, "in", if (stats.loop != null) .{ .string = "thinking" } else if (stats.answer_loop != null) .{ .string = "answer" } else .null);
+    if (stats.loop != null) if (stats.answer_loop) |h| {
+        const answer = try json.newObject(a);
+        try answer.put(a, "period", try json.intValue(a, h.period));
+        try answer.put(a, "at_token", try json.intValue(a, h.at_token));
+        try o.put(a, "answer", .{ .object = answer });
+    };
+    return .{ .object = o };
+}
 
 /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
 const StopHook = struct {

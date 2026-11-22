@@ -115,7 +115,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
-        .loop_guard = args.loop_guard,
+        .loop_policy = cli.loopPolicy(args),
         .keep_warm_s = args.keep_warm,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
@@ -125,14 +125,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,
+        .reap_stats = if (env(s, "TF_DS_REAP_STATS")) |v| std.mem.eql(u8, v, "1") else false,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
         return 1;
     };
     defer srv.deinit();
-    if (args.loop_guard and !srv.info.loop_guard) {
-        std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+    if (config.loop_policy != .off and !srv.info.loop_guard) {
+        std.debug.print("tensorfold: --loop-policy {s} is not supported by this native engine\n", .{@tagName(config.loop_policy)});
         return 2;
     }
     if (raiseOpenFileLimit()) |r| log.line("open-file limit raised: soft {d} -> {d}", .{ r[0], r[1] });

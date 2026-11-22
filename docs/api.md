@@ -237,12 +237,20 @@ The cut depends on token count, so serial and drafted decoding use the same cut.
 earlier is left alone. The MLX engine forces the close inside its rounds; CUDA stops the engine at the cut and
 decodes on from the reply, as for a required tool call.
 
-The native `--loop-guard` flag is off by default in the binary; the served pair turns it on (serve.conf's
-`LOOP_GUARD=1`, the default). It watches only an open think block. It closes a repeated exact cycle of at most 64 tokens
-after 256 predecessor matches, when the detected region starts at least 64 reply tokens in; the reply continues after
-the forced close, and reports `runtime.loop: {"period": N}` plus `loop=period:N` in the server log. Thinking that
-repeats one short line exactly for that long, such as identical table rows, trips it too; the reply still goes on. The
-native engine refuses the flag on backends that do not enforce it, and prints that refusal as a startup error.
+The native `--loop-policy {off,close,stop,count}` flag (off by default in the binary; `--loop-guard` is its old name for
+`close`) chooses what a repeated exact cycle does. The detector finds a cycle of at most 64 tokens after 256 predecessor
+matches, when the detected region starts at least 64 tokens in. In an open think block, `close` forces the think close
+and the reply continues; `stop` ends the reply at the firing token with `finish_reason: "loop"` (no forced close, no
+answer); `count` records it and changes nothing. A cycle in the answer (after the think close, or the whole reply when
+thinking is off) is counted under every policy and never acted on. The served confs set `LOOP_POLICY=stop`
+(serve.conf, tp4.conf; `LOOP_GUARD=1` still means close when `LOOP_POLICY` is unset). Every policy but `off` reports
+`tensorfold.loop: {"policy", "fired", "period", "at_token", "in"}` on the reply (non-streaming, and the final streaming
+chunk): `in` is `"thinking"` or `"answer"` for the first loop found, `at_token` the 0-based completion token index
+that completed the cycle's run, and `period`, `at_token` and `in` are null when nothing fired; an answer loop after a
+thinking loop adds `"answer": {"period", "at_token"}`. `/metrics` counts them as
+`tensorfold:loop_detections_total{in="thinking"|"answer",policy="..."}`, and the server log adds `loop=period:N` and
+`answer_loop=period:N`. Thinking that repeats one short line exactly for that long, such as identical table rows, trips
+it too. The native engine refuses the flag on backends that do not enforce it, and prints that refusal as a startup error.
 
 ## Context and errors
 
@@ -290,8 +298,8 @@ TensorFold also reports generation statistics such as decode rate, time to first
 Native JSON replies also carry a `tensorfold` runtime block with `engine`, `enable_thinking`,
 `reasoning_effort`, `tokens_per_second`, `seconds`, `time_to_first_token`, `prefill_seconds`,
 `prefill_widths`, `prefill_raised`, `sampling`, `drafts`, `token_sha`, and the draft counters
-`rounds`, `drafted`, `accepted`, `acceptance_rate`, and `tokens_per_round`. A loop-guarded reply adds
-`runtime.loop.period`; these fields describe the native reply and are absent
+`rounds`, `drafted`, `accepted`, `acceptance_rate`, and `tokens_per_round`. With a loop policy on, a reply adds
+`loop` (above); these fields describe the native reply and are absent
 from Python replies that do not provide them.
 
 The native server's finish log names the client reply ID. Completed requests report `prompt`, `cached`,

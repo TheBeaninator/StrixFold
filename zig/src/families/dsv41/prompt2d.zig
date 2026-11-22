@@ -34,6 +34,49 @@ const nccl = gpu.nccl;
 pub const split = @import("fan.zig").split;
 pub const Fan = @import("fan.zig").Fan;
 
+/// The world-4 contract coll-model.md (TP4 collectives model, contract assumption 5) leaves to the caller: both pairs of
+/// an exchange take the same number of slot chunks, because CoreN expects a trailer from every rank at every chunk (a
+/// pair that finishes early leaves the other with Mismatch or Timeout, fail-stop but a stalled prefill). catRank
+/// (g ^ 2) and engramSum's bf16 step (g ^ 2) move {w0, w1} between the partners, so they are symmetric by construction;
+/// engramSum's fp32 step (g ^ 1) moves n * w[p] * esize bytes each way in pair p, so it holds only while
+/// ceil(n * w[0] * esize / half) == ceil(n * w[1] * esize / half) for every row count n up to `cap`.
+/// `half` is Layout.exchangeHalf (the bytes one side of a slot exchange carries); null when the slot size is not known
+/// yet (Two.init runs before the collectives are open): then the widths must be equal, which is the only split that
+/// holds for every slot size. The message names the tensor and the first row count that breaks it; null: parity holds.
+pub fn chunkParityMessage(buf: []u8, tensor: []const u8, w: [2]usize, esize: usize, cap: usize, half: ?u64) ?[]const u8 {
+    if (w[0] == w[1]) return null;
+    if (half) |h| {
+        var n: usize = 1;
+        while (n <= cap) : (n += 1) {
+            const a = std.math.divCeil(u64, @as(u64, n) * w[0] * esize, h) catch unreachable;
+            const b = std.math.divCeil(u64, @as(u64, n) * w[1] * esize, h) catch unreachable;
+            if (a != b) return std.fmt.bufPrint(buf, "world-4 chunk parity: {s}: pair 0 takes {d} slot chunks and pair 1 {d} at {d} rows (columns {d} / {d}, {d} bytes each, slot half {d} bytes); the pairs of one exchange must take the same count", .{ tensor, a, b, n, w[0], w[1], esize, h }) catch "world-4 chunk parity violated";
+        }
+        return null;
+    }
+    return std.fmt.bufPrint(buf, "world-4 chunk parity: {s}: the pairs' widths differ ({d} / {d} columns of {d} bytes), so for some slot sizes and row counts the two pairs take different slot chunk counts; the split must give equal widths", .{ tensor, w[0], w[1], esize }) catch "world-4 chunk parity violated";
+}
+
+/// Refuse (error.ChunkCountMismatch) when the pairs of an exchange could take different chunk counts; `msg` gets the
+/// message naming the tensor (a slice of `buf`).
+pub fn refuseChunkMismatch(buf: []u8, msg: *[]const u8, tensor: []const u8, w: [2]usize, esize: usize, cap: usize, half: ?u64) error{ChunkCountMismatch}!void {
+    msg.* = chunkParityMessage(buf, tensor, w, esize, cap, half) orelse return;
+    return error.ChunkCountMismatch;
+}
+
+/// The startup check: refuse, logging the message that names the tensor.
+pub fn checkChunkParity(tensor: []const u8, w: [2]usize, esize: usize, cap: usize, half: ?u64) error{ChunkCountMismatch}!void {
+    var buf: [384]u8 = undefined;
+    var msg: []const u8 = "";
+    refuseChunkMismatch(&buf, &msg, tensor, w, esize, cap, half) catch |e| {
+        std.log.err("{s}", .{msg});
+        return e;
+    };
+}
+
+/// The exchanged tensors of this node's split that have a pair-dependent size: Engram wkv's fp32 columns (engramSum g ^ 1).
+pub const engram_exchange = "engram.wkv fp32 partials (engramSum, g^1 exchange)";
+
 fn len(r: ?[2]usize) usize {
     const x = r orelse return 0;
     return x[1] - x[0];
@@ -78,6 +121,8 @@ pub const Two = struct {
         for (w.layers) |lay| engram = engram or lay.engram_wkv != null;
         t.ew = if (engram) .{ len(s0.engramCols(c.*)), len(s1.engramCols(c.*)) } else .{ 0, 0 };
         t.hw = .{ len(s0.headCols(c.*)), len(s1.headCols(c.*)) };
+        // both pairs of every world-4 exchange must take the same number of slot chunks (the slot size is not known here: equal widths)
+        try checkChunkParity(engram_exchange, t.ew, 4, cap, null);
         // the weights loaded here are this split's
         const l0 = w.layers[0];
         if (l0.wq_b.n != t.heads * c.head_dim or l0.groups * c.o_lora != t.uw[pp] or l0.wo_b.n != t.ow[pp] or
@@ -256,14 +301,20 @@ pub const Two = struct {
         const n = ch.n;
         if (n < exl3_experts.exact_rows) {
             try t.catRank(e, ch.xsd.xd, t.xd_full, n * ch.xsd.slots, t.gu, 2);
-            return exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+            var sc = ch.xsd;
+            sc.reap_y = 0;
+            try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, sc, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+            if (e.reap_note != null) try prompt.reapNoteCapture(e, lay.idx, n, sc.slots, sc.y, ch.reap_bank, 2);
+            return;
         }
         if (e.ex.pf) |*pf| if (exl3_experts2d.pfPlans(lay.experts, ch.xs, ch.x, c.hidden, ch.pick, ch.wts, t.xd_full, ch.pm, n, c.swiglu_limit)) |pl| {
             try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
-            return exl3_experts.pfDown(pf, e.s, pl.down);
+            try exl3_experts.pfDown(pf, e.s, pl.down);
+            return prompt.reapNoteCapture(e, lay.idx, n, ch.xs.slots, ch.xs.z, ch.reap_bank, 2);
         };
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+        try prompt.reapNoteCapture(e, lay.idx, n, ch.xs.slots, 0, ch.reap_bank, 0);
     }
 
     /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum

@@ -5,6 +5,7 @@ const coll = @import("coll.zig");
 const Fan = @import("fan.zig").Fan;
 const tcp_coll = @import("tcp_coll.zig");
 const tcp_proxy = @import("tcp_proxy.zig");
+const comm = @import("comm.zig");
 pub const nic = @import("rdma_nic.zig");
 pub const Core = @import("rdma_core.zig").Core;
 
@@ -49,7 +50,12 @@ pub const RdmaProxy = struct {
 
     /// `stream` is the begin's; the end must be on it (see gatherEnd)
     const Begun = struct { host: bool, recv: u64, bytes: usize, stream: gpu.Stream };
-    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .exchange = exchangeColl, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+
+    /// REAP's partials are one exchange and do not fit the slot gather. The host link moves them.
+    pub fn providesExchange() bool {
+        return vtable.exchange != null;
+    }
 
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
         const t: *RdmaProxy = @ptrCast(@alignCast(ptr));
@@ -106,6 +112,15 @@ pub const RdmaProxy = struct {
         };
         const code = core.run();
         if (code != 0) t.poison(code);
+    }
+
+    /// The host link's point to point (tcp_coll.exchangeColl). A slot gather stays on the proxy.
+    fn exchangeColl(ptr: *anyopaque, stream: gpu.Stream, site: coll.Site, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, peer: u32) coll.Error!void {
+        const t: *RdmaProxy = @ptrCast(@alignCast(ptr));
+        if (t.status()) |e| return e;
+        if (t.begun != null) return t.misuse("an exchange while a begun gather is pending");
+        const f = t.host.coll_().vtable.exchange orelse return t.misuse("an exchange this transport does not provide");
+        return f(t.host, stream, site, send, send_bytes, recv, recv_bytes, peer);
     }
 
     fn allGather(ptr: *anyopaque, stream: gpu.Stream, site: coll.Site, send: u64, recv: u64, bytes: usize) coll.Error!void {
@@ -317,6 +332,10 @@ pub const RdmaProxyN = struct {
 
     const Begun = struct { site: u32, send: u64, recv: u64, bytes: usize, stream: gpu.Stream, chunks: u64 };
     const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .exchange = exchange, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+
+    pub fn providesExchange() bool {
+        return vtable.exchange != null;
+    }
 
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
         const t: *RdmaProxyN = @ptrCast(@alignCast(ptr));
@@ -576,6 +595,17 @@ fn openN(gpa: std.mem.Allocator, ctx: *const gpu.Context, kit: *const gpu.Kit, f
         id.world, id.rank, dev_name, gid_index, t.nics.active_mtu, id.world - 1, nslot, slot_bytes >> 10, lanes, layout.gatherChunk(), layout.exchangeHalf(), lanes, proxy_cpu, t.progress_ns / std.time.ns_per_ms,
     });
     return t.coll_();
+}
+
+test "every collective a HIP serve opens provides exchange" {
+    // tcp_coll and tcp_proxy at world 2, this file's two-rank proxy (TP2, TF_COLL_KIND=rdma),
+    // RdmaProxyN at world 4, and Comm (RCCL). World 2 has no fake-link harness: rdma_proxy_test
+    // is a real HCA loopback, so the byte move is the host TcpColl this exchange delegates to.
+    try std.testing.expect(tcp_coll.TcpColl.providesExchange());
+    try std.testing.expect(tcp_proxy.TcpProxy.providesExchange());
+    try std.testing.expect(RdmaProxy.providesExchange());
+    try std.testing.expect(RdmaProxyN.providesExchange());
+    try std.testing.expect(comm.Comm.providesExchange());
 }
 
 test {

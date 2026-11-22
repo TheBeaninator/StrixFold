@@ -126,6 +126,22 @@ What the branch carries on top of upstream `93d28458`:
   keepalives, `_exit` after teardown on HIP, the `/cache` transfer routes (off by default), the picture cache
   (`ENCODE_CACHE_MIB`), the disk tier at world 4, a 256 MiB request body limit, and Pillow from the deploy
   (`TF_PIL_PATH`) so JPEG and other non-PNG pictures decode on boxes without Pillow.
+- Edge-REAP routing statistics, passive and off by default (`REAP_STATS=1` on every rank): per expert and MoE
+  layer, token counts, gate mass and the sampled norm of each routed expert's output, collected from normal traffic.
+  `REAP_EVERY` (decode sample period), `REAP_PREFILL_ROWS` (prompt rows sampled per chunk), `REAP_BUCKETS` (domain
+  cap), `REAP_DIR` and `REAP_SNAPSHOT_MIN` (periodic JSON snapshots) set it up. `GET /stats/reap` returns the
+  export, in the format of `export_report` in `strix_moe_surgery.py`, behind the `CACHE_TRANSFER_KEY` bearer. A
+  request picks its domain with `reap_domain` in the body or the `x-reap-domain` header. On the four boxes, replies
+  were byte-identical with it on and off, and one chat decoded at 88.2 tok/s with it on against 88.4 off. Design and
+  numbers: `docs/experiments/tp4-reap-stats.md`.
+- A loop policy (`LOOP_POLICY` = `off`, `close`, `stop` or `count`; unset keeps `LOOP_GUARD`'s behaviour): an
+  exact token cycle while thinking is open either ends the reply with `finish_reason` `"loop"` (`stop`), forces the
+  think close (`close`), or is only reported (`count`). Every policy but `off` adds `tensorfold.loop` to the reply
+  (on `/v1/chat/completions`, `/v1/messages` and `/v1/responses`) and counts `tensorfold:loop_detections_total` in
+  `/metrics`.
+- A guard for uneven splits at world 4: the engine refuses to open when the two pairs' exchanges would take different
+  chunk counts for some tensor and row count, naming the tensor and the first row count that breaks, instead of
+  deadlocking on the first such exchange.
 
 To run it:
 

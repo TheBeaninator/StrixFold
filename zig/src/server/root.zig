@@ -45,6 +45,7 @@ test {
     _ = @import("shared_messages_test.zig");
     _ = @import("cache_key.zig");
     _ = @import("cache_routes_test.zig");
+    _ = @import("reap_routes_test.zig");
     _ = @import("http_body_test.zig");
     _ = @import("effort_values_test.zig");
     _ = @import("telemetry_reply_test.zig");

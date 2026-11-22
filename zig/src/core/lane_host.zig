@@ -164,7 +164,24 @@ pub const LaneHost = struct {
     }
 
     pub fn engine(h: *LaneHost) Engine {
-        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn, .cache = cache_mail.cacheFn, .cache_shape = cache_mail.shapeFn } };
+        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn, .cache = cache_mail.cacheFn, .cache_shape = cache_mail.shapeFn, .reap = reapFn, .reap_admit = reapAdmitFn } };
+    }
+
+    /// The lanes hook the family installs at model open. Nothing installed: an empty bucket list.
+    fn reapFn(_: *anyopaque, q: *api.ReapQuery) void {
+        var hq: lanes.reap_hook.Query = .{ .domain = q.domain, .modality = q.modality, .allocator = q.allocator };
+        if (!lanes.reap_hook.query(&hq)) {
+            q.status = 200;
+            q.out = q.allocator.dupe(u8, "{\"buckets\":[]}") catch null;
+            if (q.out == null) q.status = 500;
+            return;
+        }
+        q.out = hq.out;
+        q.status = hq.status;
+    }
+
+    fn reapAdmitFn(_: *anyopaque, domain: []const u8, index: *u32, err: []u8) usize {
+        return lanes.reap_hook.admit(domain, index, err);
     }
 
     /// The family's queue as a keepalive target, when it set one.
@@ -313,6 +330,7 @@ pub const LaneHost = struct {
             .length => .length,
             .cancelled => .cancelled,
             .@"error" => .failed,
+            .loop => .loop,
             else => .stop,
         };
         h.finish(job, reason, "");
@@ -325,7 +343,7 @@ pub const LaneHost = struct {
         h.gpa.free(job.marks);
         job.freeKey();
         const s = &job.stream;
-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null, .telemetry_json = s.telemetry_buf[0..s.telemetry_len] } else .{};
+        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop = s.loop, .answer_loop = s.answer_loop, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null, .telemetry_json = s.telemetry_buf[0..s.telemetry_len] } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             s.deinit(h.gpa);
@@ -440,13 +458,14 @@ pub const LaneHost = struct {
             .think_budget = r.think_budget,
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,
-            .loop_guard = r.loop_guard,
+            .loop_policy = r.loop_policy,
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
             .cache_key = job.key orelse &.{},
             .cache_spans = job.spans,
             .structure = r.structure,
+            .reap_bucket = r.reap_bucket,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
@@ -525,7 +544,7 @@ pub const LaneHost = struct {
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         const lone = h.lone orelse return false;
-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_policy != .off or r.call != null or r.structure != null) return false;
         h.lock();
         defer h.unlock();
         return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
@@ -645,6 +664,7 @@ pub const LaneHost = struct {
         while (true) {
             h.takeCancels();
             cache_mail.takeOps(h);
+            lanes.reap_hook.service();
             if (h.filling == null) {
                 while (h.admitOne()) {}
             }

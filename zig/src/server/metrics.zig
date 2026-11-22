@@ -41,6 +41,10 @@ pub const Metrics = struct {
     accepted: u64 = 0,
     rounds: u64 = 0,
     disconnects: u64 = 0,
+    /// The server's loop policy (null: off, no loop family) and the loops its finished requests found.
+    loop_policy: ?api.LoopPolicy = null,
+    loops_thinking: u64 = 0,
+    loops_answer: u64 = 0,
     latency: Histogram = .{},
     ttft: Histogram = .{},
     decode: Histogram = .{},
@@ -78,6 +82,15 @@ pub const Metrics = struct {
         };
         const owned = m.gpa.dupe(u8, key) catch return;
         m.requests.append(m.gpa, .{ .key = owned, .status = status, .count = 1 }) catch m.gpa.free(owned);
+    }
+
+    /// A finished request's loops: the thinking loop its policy found, and a loop in its answer.
+    pub fn noteLoops(m: *Metrics, io: std.Io, thinking: bool, answer: bool) void {
+        if (!thinking and !answer) return;
+        m.mutex.lockUncancelable(io);
+        defer m.mutex.unlock(io);
+        m.loops_thinking += @intFromBool(thinking);
+        m.loops_answer += @intFromBool(answer);
     }
 
     pub fn disconnected(m: *Metrics, io: std.Io) void {
@@ -141,6 +154,11 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        if (snap.loop_policy) |policy| if (policy != .off) {
+            try family(w, "loop_detections_total", "counter", "Finished requests in which an exact token cycle (period up to 64, 256 tokens) was found, by part; the policy acts on thinking loops only (close, stop) or never (count).");
+            try w.print("{s}loop_detections_total{{in=\"thinking\",policy=\"{s}\"}} {d}\n", .{ prefix, @tagName(policy), snap.loops_thinking });
+            try w.print("{s}loop_detections_total{{in=\"answer\",policy=\"{s}\"}} {d}\n", .{ prefix, @tagName(policy), snap.loops_answer });
+        };
     }
 };
 
@@ -322,4 +340,24 @@ test "request counter append failure frees its label" {
     m.httpRequest(std.testing.io, "client", 200);
     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
     try std.testing.expectEqual(allocations, failing.allocations);
+}
+
+test "loop detections are counted by part under the server's policy, and absent with the policy off" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var off: std.Io.Writer.Allocating = .init(gpa);
+    defer off.deinit();
+    try m.render(std.testing.io, &off.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, off.written(), "loop_detections_total") == null);
+    m.loop_policy = .stop;
+    m.noteLoops(std.testing.io, true, false);
+    m.noteLoops(std.testing.io, true, true);
+    m.noteLoops(std.testing.io, false, false);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "# TYPE tensorfold:loop_detections_total counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tensorfold:loop_detections_total{in=\"thinking\",policy=\"stop\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tensorfold:loop_detections_total{in=\"answer\",policy=\"stop\"} 1\n") != null);
 }

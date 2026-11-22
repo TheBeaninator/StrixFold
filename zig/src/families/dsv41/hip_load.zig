@@ -52,6 +52,54 @@ pub const params = struct {
     pub const AuxGate = extern struct { a: tri_aux.GateArgs };
     pub const AuxRopeHeads = extern struct { a: tri_aux.RopeHeadsArgs };
     pub const AuxMarkovRace = extern struct { a: tri_aux.MarkovRaceArgs };
+    // reap.hip, field for field with the C parameters (u64 addresses, then u32 scalars).
+    pub const ReapPack = extern struct {
+        src: u64,
+        dst: u64,
+        rows_idx: u64,
+        layers: u32,
+        rows_cap: u32,
+        slots: u32,
+        topk: u32,
+        dn: u32,
+        n_sample: u32,
+    };
+    pub const ReapSsq = extern struct { y0: u64, y1: u64, out: u64, nvec: u32, dn: u32 };
+    pub const ReapRoute = extern struct {
+        pick: u64,
+        wts: u64,
+        pos: u64,
+        commit: u64,
+        bucket: u64,
+        token: u64,
+        gate: u64,
+        early: u64,
+        layers: u32,
+        rows: u32,
+        row_stride: u32,
+        slots: u32,
+        topk: u32,
+        nexp: u32,
+        nbucket: u32,
+    };
+    pub const ReapNorm = extern struct {
+        pick: u64,
+        wts: u64,
+        bucket: u64,
+        rows_idx: u64,
+        ss0: u64,
+        ss1: u64,
+        raw: u64,
+        ncount: u64,
+        maxn: u64,
+        layers: u32,
+        row_stride: u32,
+        slots: u32,
+        topk: u32,
+        nexp: u32,
+        nbucket: u32,
+        n_sample: u32,
+    };
 
     // EXL3: exl3_prefill.zig
     pub const Exl3RotIn = extern struct { x: u64, x_dtype: i32, ldx: i64, suh: u64, xh: u64, k: i32 };
@@ -137,6 +185,27 @@ pub fn vision(kit: *const gpu.Kit) !?vit_hip.Kernels {
         .span = try optional(kit, "vision.span", vp.Span) orelse return error.MissingKernel,
     };
     return k;
+}
+
+/// reap.hip's four kernels. Null when the kit has none of them (an older kit: REAP stays off).
+/// One present and another missing is MissingKernel, so a partial kit cannot serve with REAP on.
+pub fn reap(kit: *const gpu.Kit) !?struct {
+    pack: gpu.Function,
+    ssq: gpu.Function,
+    route: gpu.Function,
+    norm: gpu.Function,
+} {
+    const p = params;
+    const pack = try optional(kit, "reap.pack", p.ReapPack) orelse {
+        if (kit.find("reap.ssq", &.{}) == null and kit.find("reap.route", &.{}) == null and kit.find("reap.norm", &.{}) == null) return null;
+        return error.MissingKernel;
+    };
+    return .{
+        .pack = pack,
+        .ssq = try optional(kit, "reap.ssq", p.ReapSsq) orelse return error.MissingKernel,
+        .route = try optional(kit, "reap.route", p.ReapRoute) orelse return error.MissingKernel,
+        .norm = try optional(kit, "reap.norm", p.ReapNorm) orelse return error.MissingKernel,
+    };
 }
 
 /// Nanoseconds a tick of a `hz` clock in 32.32 fixed point (glue.clock's ns_q32), rounded to nearest.

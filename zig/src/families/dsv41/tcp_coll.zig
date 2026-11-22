@@ -109,7 +109,11 @@ pub const TcpColl = struct {
     /// the upload `uploaded` marks (its gather), for waitUploaded's log line
     uploading: Wait = .{ .op = "upload", .site = .{ .phase = .test_only, .layer = 0 }, .bytes = 0 },
 
-    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+    const vtable: coll.Coll.VTable = .{ .all_gather = allGather, .exchange = exchangeColl, .abort = abort, .close = close, .gather_begin = gatherBegin, .gather_end = gatherEnd, .check = check, .counts = counts };
+
+    pub fn providesExchange() bool {
+        return vtable.exchange != null;
+    }
 
     fn counts(ptr: *anyopaque) coll.Coll.Counts {
         const t: *TcpColl = @ptrCast(@alignCast(ptr));
@@ -273,6 +277,38 @@ pub const TcpColl = struct {
         t.uploading = .{ .op = "upload", .site = site, .bytes = bytes };
         const own = recv + @as(u64, t.rank) * bytes;
         if (own != send) gpu.copyD2DAsync(t.d, stream.handle, own, send, bytes) catch return t.gpuFail();
+    }
+
+    /// Point to point with the one peer (world 2). `recv` gets the peer's bytes, not an all-gather slot.
+    /// The call waits for this rank's copy off the device, moves the bytes, and queues the peer's bytes onto
+    /// `stream` before returning, so a kernel queued next sees them. REAP's sampled partials use it; gathers do not.
+    fn exchangeColl(ptr: *anyopaque, stream: gpu.Stream, site: coll.Site, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, peer: u32) coll.Error!void {
+        const t: *TcpColl = @ptrCast(@alignCast(ptr));
+        if (t.status()) |e| return e;
+        if (t.begun != null) return t.misuse("an exchange while a begun gather is pending");
+        if (peer != 1 - t.rank) return t.misuse("an exchange with a rank this link does not have");
+        if (send_bytes != recv_bytes) return t.misuse("an exchange whose send and receive sizes differ");
+        if (send_bytes == 0) return;
+        try t.ensure(send_bytes);
+        try t.waitUploaded();
+        const tx = t.tx.?.bytes[0..send_bytes];
+        const rx = t.rx.?.bytes[0..send_bytes];
+        if (t.staging == .blit) {
+            gpu.copyD2DAsync(t.d, stream.handle, t.tx_dev, send, send_bytes) catch return t.gpuFail();
+        } else {
+            t.d.check(t.d.api.hipMemcpyDtoHAsync(@ptrCast(tx.ptr), gpu.abi.ptr(send), send_bytes, stream.handle), "hipMemcpyDtoHAsync") catch return t.gpuFail();
+        }
+        t.staged.record(stream) catch return t.gpuFail();
+        try t.spinEvent(t.staged, .{ .op = "staged", .site = site, .bytes = send_bytes });
+        try t.exchange(site, tx, rx, 0, 1);
+        if (t.staging == .blit) {
+            gpu.copyD2DAsync(t.d, stream.handle, recv, t.rx_dev, send_bytes) catch return t.gpuFail();
+        } else {
+            gpu.uploadPinned(t.d, stream, recv, rx) catch return t.gpuFail();
+        }
+        t.uploaded.record(stream) catch return t.gpuFail();
+        t.upload_pending = true;
+        t.uploading = .{ .op = "upload", .site = site, .bytes = send_bytes };
     }
 
     /// The first half of a gather (coll.Coll.gatherBegin), and of every large one (>= pipe_min, in chunks): after the

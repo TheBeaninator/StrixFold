@@ -12,6 +12,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const elf = @import("elf.zig");
 const weights = @import("weights.zig");
+const reap = @import("reap.zig");
 
 /// experts.py's settings (GLM_GATEUP, GLM_DOWN by default_config; PROMPT_TILES; MMA_KB; EXACT_ROWS; DECODE_STAGES).
 pub const exact_rows = 64;
@@ -507,6 +508,9 @@ pub const DecodeScratch = struct {
     ids: u64, // int32 [maxu], zeros
     count: u64, // int32 [1], zeros
     members: u64, // int32 [maxu * ceil(rows / 128) * 128], -1
+    /// REAP: the down epilogue's y. 0 keeps sc.y and the base discard. Not one of sizes()' buffers.
+    /// Prep and the gate / up epilogue never read this.
+    reap_y: u64 = 0,
 
     /// Bytes of each buffer, in the field order above (xg .. members); maxu = min(rows * slots, E).
     pub fn sizes(rows: usize, slots: usize, d: usize, i: usize, e: usize) ![13]usize {
@@ -594,7 +598,8 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     var dn: gpu.Args = .{};
     for ([_]u64{ sc.xd, sc.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
     for ([_]usize{ i, d, p, 1, r, slots }) |v| i32a(&dn, v);
-    dn.add(DecodeEpi{ .pick = pick, .E = @intCast(e), .svh_d = ex.svh_d, .y = sc.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .ready = sc.ready, .ready_cnt = sc.ready_cnt, .epoch = sc.epoch, .discard = @intFromBool(4 * slots <= 32) });
+    const dy = reap.downY(sc.y, sc.reap_y, slots);
+    dn.add(DecodeEpi{ .pick = pick, .E = @intCast(e), .svh_d = ex.svh_d, .y = dy.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .ready = sc.ready, .ready_cnt = sc.ready_cnt, .epoch = sc.epoch, .discard = dy.discard });
 
     return .{
         .{ .kernel = .prep, .cfg = .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = prep_threads }, .shared = @intCast(2 * p * 4) }, .args = prep },
@@ -674,4 +679,43 @@ test "a TP2 DeepSeek-V4.1 rank's decode scratch and windows" {
     small.rows = 8;
     try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10));
     _ = try decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 8, 10);
+}
+
+fn argsEqualExceptDown(off: gpu.Args, on: gpu.Args) !void {
+    try std.testing.expectEqual(off.count, on.count);
+    try std.testing.expectEqual(off.used, on.used);
+    const epi = on.offsets[on.count - 1];
+    try std.testing.expectEqual(@as(u16, @sizeOf(DecodeEpi)), on.sizes[on.count - 1]);
+    var a = off;
+    var b = on;
+    // y (8 bytes at +64) and discard (4 bytes at +136) are the only down-epi bytes REAP moves
+    @memset(a.storage[epi + @offsetOf(DecodeEpi, "y") ..][0..8], 0);
+    @memset(b.storage[epi + @offsetOf(DecodeEpi, "y") ..][0..8], 0);
+    @memset(a.storage[epi + @offsetOf(DecodeEpi, "discard") ..][0..4], 0);
+    @memset(b.storage[epi + @offsetOf(DecodeEpi, "discard") ..][0..4], 0);
+    try std.testing.expectEqualSlices(u8, a.storage[0..a.used], b.storage[0..b.used]);
+}
+
+test "reap down y redirect changes only the down epilogue" {
+    const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 1152, .down_k = 1152, .down_n = 5120, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
+    const sc: DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 1, .xu = 2, .xd = 3, .z = 4, .y = 0x1000, .cnt_gu = 5, .cnt_d = 6, .epoch = 7, .ready = 8, .ready_cnt = 9, .ids = 10, .count = 11, .members = 12 };
+    var r: usize = 1;
+    while (r <= 8) : (r += 1) {
+        const off = try decodeLaunches(ex, sc, 0x20, 5120, 0x30, 0x40, 0x50, r, 10);
+        var on_sc = sc;
+        on_sc.reap_y = 0xABC0;
+        const on = try decodeLaunches(ex, on_sc, 0x20, 5120, 0x30, 0x40, 0x50, r, 10);
+        try std.testing.expectEqualSlices(u8, off[0].args.storage[0..off[0].args.used], on[0].args.storage[0..on[0].args.used]);
+        try std.testing.expectEqualSlices(u8, off[1].args.storage[0..off[1].args.used], on[1].args.storage[0..on[1].args.used]);
+        try argsEqualExceptDown(off[2].args, on[2].args);
+        const epi = on[2].args.offsets[on[2].args.count - 1];
+        const y = std.mem.readInt(u64, on[2].args.storage[epi + @offsetOf(DecodeEpi, "y") ..][0..8], .little);
+        const disc = std.mem.readInt(u32, on[2].args.storage[epi + @offsetOf(DecodeEpi, "discard") ..][0..4], .little);
+        try std.testing.expectEqual(@as(u64, 0xABC0), y);
+        try std.testing.expectEqual(@as(u32, 0), disc);
+        const y0 = std.mem.readInt(u64, off[2].args.storage[epi + @offsetOf(DecodeEpi, "y") ..][0..8], .little);
+        const d0 = std.mem.readInt(u32, off[2].args.storage[epi + @offsetOf(DecodeEpi, "discard") ..][0..4], .little);
+        try std.testing.expectEqual(@as(u64, 0x1000), y0);
+        try std.testing.expectEqual(@as(u32, 1), d0); // 4 * 7 <= 32
+    }
 }
